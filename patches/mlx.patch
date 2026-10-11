@@ -1,0 +1,236 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index feb7ce5..37b4e9a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -181,8 +181,7 @@ if(MLX_BUILD_METAL)
+     add_compile_definitions(MLX_METAL_DEBUG)
+   endif()
+ 
+-  # Probe the macOS SDK only on Darwin. On iOS the caller selects the SDK, so
+-  # version detection is deferred and the baseline Metal feature set is used.
++  # Probe the target SDK. Keep the host defaults on Darwin.
+   if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+     # Get the host macOS version.
+     execute_process(
+@@ -221,6 +220,49 @@ if(MLX_BUILD_METAL)
+       OUTPUT_VARIABLE MLX_METAL_VERSION
+       OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+     message(STATUS "Metal version: ${MLX_METAL_VERSION}")
++  elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++    # Use the selected SDK, including an explicit SDK path from the toolchain.
++    set(_mlx_ios_sdk "${CMAKE_OSX_SYSROOT}")
++    if(_mlx_ios_sdk STREQUAL "")
++      if(PLATFORM MATCHES "^SIMULATOR")
++        set(_mlx_ios_sdk iphonesimulator)
++      else()
++        set(_mlx_ios_sdk iphoneos)
++      endif()
++    endif()
++    string(TOLOWER "${_mlx_ios_sdk}" _mlx_ios_sdk_lower)
++    if(_mlx_ios_sdk_lower MATCHES "iphonesimulator")
++      set(_mlx_ios_min_flag "-mios-simulator-version-min")
++    elseif(_mlx_ios_sdk_lower MATCHES "iphoneos")
++      set(_mlx_ios_min_flag "-mios-version-min")
++    else()
++      message(FATAL_ERROR "MLX iOS build requires an iPhone SDK: ${_mlx_ios_sdk}")
++    endif()
++    execute_process(
++      COMMAND xcrun --sdk "${_mlx_ios_sdk}" --show-sdk-version
++      OUTPUT_VARIABLE _mlx_ios_sdk_version
++      OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
++    # Existing feature guards use this name for the target SDK version.
++    set(MACOS_SDK_VERSION "${_mlx_ios_sdk_version}")
++    set(MLX_METAL_VERSION 0)
++    if(NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
++      set(_mlx_metal_probe "${CMAKE_CURRENT_BINARY_DIR}/mlx_metal_version.metal")
++      file(WRITE "${_mlx_metal_probe}" "__METAL_VERSION__\n")
++      execute_process(
++        COMMAND xcrun --sdk "${_mlx_ios_sdk}" metal
++                "${_mlx_ios_min_flag}=${CMAKE_OSX_DEPLOYMENT_TARGET}"
++                -E -x metal -P "${_mlx_metal_probe}"
++        OUTPUT_VARIABLE MLX_METAL_VERSION
++        OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
++      # Metal may emit module-import pragmas before the final macro value.
++      string(REGEX MATCH "(^|[\r\n])[ \t]*([0-9]+)[ \t]*$"
++             _mlx_metal_version_line "${MLX_METAL_VERSION}")
++      if(_mlx_metal_version_line STREQUAL "")
++        message(FATAL_ERROR "Invalid iOS Metal version: ${MLX_METAL_VERSION}")
++      endif()
++      set(MLX_METAL_VERSION "${CMAKE_MATCH_2}")
++    endif()
++    message(STATUS "Building with iOS SDK ${_mlx_ios_sdk_version}; deployment ${CMAKE_OSX_DEPLOYMENT_TARGET}; Metal ${MLX_METAL_VERSION}")
+   else()
+     set(MLX_METAL_VERSION 0)
+   endif()
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 2f25f89..d560dce 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -220,8 +220,15 @@ MTL::Library* load_default_library(MTL::Device* device) {
+     return lib;
+   }
+ 
+-  // Then try default.metallib in a SwiftPM bundle if we have one
+-  std::tie(lib, error[2]) = load_swiftpm_library(device, "default");
++  // Then try the metallib in a SwiftPM bundle if we have one. The name is a
++  // build-time define because ExecuTorch ships one bundle holding a metallib per
++  // platform slice, so each slice's binary must ask for its own file rather than a
++  // single shared "default". Falls back to "default" for a plain MLX build.
++#ifndef MLX_SWIFTPM_METALLIB_NAME
++#define MLX_SWIFTPM_METALLIB_NAME "default"
++#endif
++  std::tie(lib, error[2]) =
++      load_swiftpm_library(device, MLX_SWIFTPM_METALLIB_NAME);
+   if (lib) {
+     return lib;
+   }
+diff --git a/mlx/backend/metal/kernels/CMakeLists.txt b/mlx/backend/metal/kernels/CMakeLists.txt
+index ecabbda..bebf38e 100644
+--- a/mlx/backend/metal/kernels/CMakeLists.txt
++++ b/mlx/backend/metal/kernels/CMakeLists.txt
+@@ -9,6 +9,21 @@ set(BASE_HEADERS
+     logging.h
+     utils.h)
+ 
++# The Metal SDK and deployment flag must follow the target platform. ExecuTorch
++# builds this for iOS device, iOS simulator, and macOS from one source tree and
++# passes PLATFORM in for each. Without this the shaders are always built against
++# the macOS SDK, so the iOS and simulator metallibs are wrong for their slice.
++if(PLATFORM STREQUAL "OS64")
++  set(MLX_METAL_SDK iphoneos)
++  set(MLX_METAL_VERSION_MIN_FLAG "-mios-version-min")
++elseif(PLATFORM STREQUAL "SIMULATORARM64")
++  set(MLX_METAL_SDK iphonesimulator)
++  set(MLX_METAL_VERSION_MIN_FLAG "-mios-simulator-version-min")
++else()
++  set(MLX_METAL_SDK macosx)
++  set(MLX_METAL_VERSION_MIN_FLAG "-mmacosx-version-min")
++endif()
++
+ function(build_kernel_base TARGET SRCFILE DEPS)
+   set(METAL_FLAGS
+       -x
+@@ -27,10 +42,10 @@ function(build_kernel_base TARGET SRCFILE DEPS)
+   endif()
+   if(NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+     set(METAL_FLAGS ${METAL_FLAGS}
+-                    "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
++                    "${MLX_METAL_VERSION_MIN_FLAG}=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+   endif()
+   add_custom_command(
+-    COMMAND xcrun -sdk macosx metal ${METAL_FLAGS} -c ${SRCFILE}
++    COMMAND xcrun -sdk ${MLX_METAL_SDK} metal ${METAL_FLAGS} -c ${SRCFILE}
+             -I${PROJECT_SOURCE_DIR} -o ${TARGET}.air
+     DEPENDS ${SRCFILE} ${DEPS} ${BASE_HEADERS}
+     OUTPUT ${TARGET}.air
+@@ -188,12 +203,12 @@ endif()
+ 
+ set(METAL_LINK_FLAGS)
+ if(NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+-  set(METAL_LINK_FLAGS "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
++  set(METAL_LINK_FLAGS
++      "${MLX_METAL_VERSION_MIN_FLAG}=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+ endif()
+-
+ add_custom_command(
+   OUTPUT ${MLX_METAL_PATH}/mlx.metallib
+-  COMMAND xcrun -sdk macosx metal ${METAL_LINK_FLAGS} ${KERNEL_AIR} -o
++  COMMAND xcrun -sdk ${MLX_METAL_SDK} metal ${METAL_LINK_FLAGS} ${KERNEL_AIR} -o
+           ${MLX_METAL_PATH}/mlx.metallib
+   DEPENDS ${KERNEL_AIR}
+   COMMENT "Building mlx.metallib"
+diff --git a/mlx/backend/metal/kernels/steel/utils/integral_constant.h b/mlx/backend/metal/kernels/steel/utils/integral_constant.h
+index 2f153f4..9702241 100644
+--- a/mlx/backend/metal/kernels/steel/utils/integral_constant.h
++++ b/mlx/backend/metal/kernels/steel/utils/integral_constant.h
+@@ -47,12 +47,20 @@ using Int = integral_constant<int, val>;
+ // Binary Operators on Integral constants
+ ///////////////////////////////////////////////////////////////////////////////
+ 
++#if __METAL_VERSION__ >= 410
++template <typename T>
++using remove_addrspace_t = metal::remove_addrspace_t<T>;
++#else
++template <typename T>
++using remove_addrspace_t = T;
++#endif
++
+ #define integral_const_binop(__op__, __operator__)          \
+   template <typename T, T tv, typename U, U uv>             \
+   METAL_FUNC constexpr auto __operator__(                   \
+       integral_constant<T, tv>, integral_constant<U, uv>) { \
+     constexpr auto res = tv __op__ uv;                      \
+-    using res_t = metal::remove_addrspace_t<decltype(res)>; \
++    using res_t = remove_addrspace_t<decltype(res)>;        \
+     return integral_constant<res_t, res>{};                 \
+   }
+ 
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+index 1ae99a8..3b4c83c 100644
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -1,5 +1,10 @@
+ // Copyright © 2023-2026 Apple Inc.
+ 
++#include <cstdio>
++#include <cstdlib>
++#include <stdexcept>
++#include <string_view>
++
+ #include "mlx/backend/common/quantized.h"
+ #include "mlx/backend/common/broadcasting.h"
+ #include "mlx/backend/common/compiled.h"
+@@ -1494,7 +1499,23 @@ void gather_qmm_rhs_nax(
+ 
+   // Use smaller bm for many experts and few tokens.
+   int E = w.size() / w.shape(-1) / w.shape(-2);
+-  int bm = (M / E < 64) ? 32 : 64;
++  const int auto_bm = (M / E < 64) ? 32 : 64;
++  // This experiment setting is fixed on the first sorted NAX call.
++  static const int trifuse_bm = []() {
++    const char* value = std::getenv("TRIFUSE_SORTED_QMM_BM");
++    if (!value || !*value || std::string_view(value) == "auto") {
++      return 0;
++    }
++    if (std::string_view(value) == "32") {
++      return 32;
++    }
++    if (std::string_view(value) == "64") {
++      return 64;
++    }
++    throw std::invalid_argument(
++        "TRIFUSE_SORTED_QMM_BM must be auto, 32 or 64");
++  }();
++  int bm = trifuse_bm ? trifuse_bm : auto_bm;
+   int bn = 64, bk = 64;
+   int wm = 2, wn = 2;
+ 
+@@ -1581,6 +1602,28 @@ void gather_qmm_rhs_nax(
+   compute_encoder.set_bytes(K, c++);
+ 
+   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
++  if (trifuse_bm) {
++    static const bool reported = [&]() {
++      std::fprintf(
++          stderr,
++          "TRIFUSE_SORTED_QMM_BM_HIT path=sorted_rhs_nax event=encoded "
++          "bm=%d auto_bm=%d rows=%d experts=%d rows_per_expert=%d "
++          "output_channels=%d input_channels=%d bits=%d group_size=%d "
++          "transpose=%d\n",
++          bm,
++          auto_bm,
++          M,
++          E,
++          M / E,
++          N,
++          K,
++          bits,
++          group_size,
++          int(transpose));
++      return true;
++    }();
++    (void)reported;
++  }
+ }
+ 
+ void gather_qmm_rhs(

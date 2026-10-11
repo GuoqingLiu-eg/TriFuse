@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "repositories": {
+    "executorch": {
+      "url": "https://github.com/pytorch/executorch.git",
+      "revision": "3b60683923245cf472b7323426920e15623ba361",
+      "destination": "trifuse/executorch"
+    },
+    "mlx": {
+      "url": "https://github.com/ml-explore/mlx.git",
+      "revision": "1f8e74e3f12f31365464a6867c6579f0e9b29d85",
+      "destination": "trifuse/executorch/backends/mlx/third-party/mlx"
+    }
+  }
+}

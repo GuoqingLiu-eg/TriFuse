@@ -1,0 +1,16 @@
+# Versions used by this source snapshot on Apple Silicon / Python 3.12.
+cmake==3.31.10
+ninja==1.13.2
+executorch==1.5.1
+torch==2.14.0
+torchao==0.18.0
+flatbuffers==25.12.19
+Jinja2==3.1.6
+PyYAML==6.0.3
+ruamel.yaml==0.19.1
+numpy==2.5.3
+packaging==26.3
+setuptools==84.0.0
+zstd==1.5.7.2
+safetensors==0.8.0
+coremltools==9.0

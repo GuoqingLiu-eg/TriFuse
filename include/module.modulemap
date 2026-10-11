@@ -1,0 +1,5 @@
+module TriFuse {
+  requires objc
+  header "trifuse/apple/TFETResidentSession.h"
+  export *
+}

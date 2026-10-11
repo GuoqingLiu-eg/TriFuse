@@ -1,0 +1,3702 @@
+diff --git a/backends/mlx/CMakeLists.txt b/backends/mlx/CMakeLists.txt
+index 75bfc1f..972a4f4 100644
+--- a/backends/mlx/CMakeLists.txt
++++ b/backends/mlx/CMakeLists.txt
+@@ -23,6 +23,10 @@ include(${EXECUTORCH_ROOT}/tools/cmake/Utils.cmake)
+ 
+ set(_common_compile_options -Wall -Werror -Wno-deprecated-declarations)
+ 
++option(EXECUTORCH_MLX_ENABLE_CPU
++       "Build MLX CPU kernels alongside the Metal backend" OFF
++)
++
+ # Sanitizer flags (asan + ubsan) for security hardening — CI only. Enable via:
+ # cmake --preset mlx-release -DEXECUTORCH_MLX_ENABLE_SANITIZERS=ON
+ option(EXECUTORCH_MLX_ENABLE_SANITIZERS
+@@ -243,6 +247,10 @@ set(_mlx_build_type "$<IF:$<BOOL:$<CONFIG>>,$<CONFIG>,Release>")
+ cmake_host_system_information(
+   RESULT _mlx_host_cores QUERY NUMBER_OF_LOGICAL_CORES
+ )
++if(DEFINED ENV{CMAKE_BUILD_PARALLEL_LEVEL}
++   AND "$ENV{CMAKE_BUILD_PARALLEL_LEVEL}" MATCHES "^[1-9][0-9]*$")
++  set(_mlx_host_cores "$ENV{CMAKE_BUILD_PARALLEL_LEVEL}")
++endif()
+ if(CMAKE_GENERATOR MATCHES "Make")
+   set(_mlx_build_command "")
+ else()
+@@ -274,9 +282,9 @@ ExternalProject_Add(
+              -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
+              -DPLATFORM=${PLATFORM}
+              -DDEPLOYMENT_TARGET=${DEPLOYMENT_TARGET}
+-             # We only need the static Metal C++ library.
++             # Metal remains enabled; CPU execution is explicitly opt-in.
+              -DMLX_BUILD_METAL=ON
+-             -DMLX_BUILD_CPU=OFF
++             -DMLX_BUILD_CPU=${EXECUTORCH_MLX_ENABLE_CPU}
+              -DMLX_BUILD_CUDA=OFF
+              -DMLX_BUILD_SHARED_LIBS=OFF
+              -DMLX_BUILD_PYTHON_BINDINGS=OFF
+@@ -328,8 +336,7 @@ ExternalProject_Add_Step(
+ 
+ # Imported target for the MLX static library produced by mlx_external. A static
+ # libmlx.a carries no transitive link deps, so re-add the frameworks MLX itself
+-# links (mirrors third-party/mlx/CMakeLists.txt:209). CPU is OFF, so Accelerate
+-# is not needed.
++# links, including Accelerate when the CPU kernels are enabled.
+ add_library(mlx STATIC IMPORTED GLOBAL)
+ set_target_properties(mlx PROPERTIES IMPORTED_LOCATION ${_mlx_static_lib})
+ # Headers come from the submodule source tree (always present), not the build
+@@ -340,10 +347,16 @@ target_include_directories(mlx INTERFACE ${MLX_SOURCE_DIR})
+ find_library(METAL_FRAMEWORK Metal)
+ find_library(FOUNDATION_FRAMEWORK Foundation)
+ find_library(QUARTZ_FRAMEWORK QuartzCore)
++set(_mlx_frameworks
++    "${METAL_FRAMEWORK};${FOUNDATION_FRAMEWORK};${QUARTZ_FRAMEWORK}"
++)
++if(EXECUTORCH_MLX_ENABLE_CPU)
++  find_library(ACCELERATE_FRAMEWORK Accelerate REQUIRED)
++  list(APPEND _mlx_frameworks "${ACCELERATE_FRAMEWORK}")
++endif()
+ set_target_properties(
+   mlx
+-  PROPERTIES INTERFACE_LINK_LIBRARIES
+-             "${METAL_FRAMEWORK};${FOUNDATION_FRAMEWORK};${QUARTZ_FRAMEWORK}"
++  PROPERTIES INTERFACE_LINK_LIBRARIES "${_mlx_frameworks}"
+ )
+ 
+ # -----------------------------------------------------------------------------
+@@ -375,6 +388,9 @@ else()
+   set(_mlx_backend_library_type STATIC)
+ endif()
+ add_library(mlxdelegate ${_mlx_backend_library_type} ${_mlx_backend__srcs})
++target_compile_definitions(
++  mlxdelegate PRIVATE ET_MLX_ENABLE_CPU=$<BOOL:${EXECUTORCH_MLX_ENABLE_CPU}>
++)
+ 
+ # Ensure schema is generated before compiling
+ add_dependencies(mlxdelegate mlx_schema)
+diff --git a/backends/mlx/custom_ops.py b/backends/mlx/custom_ops.py
+index ecf8299..6a2ecda 100644
+--- a/backends/mlx/custom_ops.py
++++ b/backends/mlx/custom_ops.py
+@@ -19,6 +19,9 @@ from typing import Optional, Tuple
+ import torch
+ from torch import Tensor
+ 
++# Native checkpoint Q/S/B operators are separate from the TorchAO repacking ABI.
++from executorch.backends.mlx import native_affine_ops as _native_affine_ops  # noqa: F401,E402
++
+ 
+ @torch.library.custom_op("mlx::kv_cache_update", mutates_args=("cache",))
+ def kv_cache_update(
+diff --git a/backends/mlx/ops.py b/backends/mlx/ops.py
+index 67f81b8..effa9ef 100644
+--- a/backends/mlx/ops.py
++++ b/backends/mlx/ops.py
+@@ -180,6 +180,8 @@ from executorch.extension.llm.cache import (  # noqa: F401
+ )
+ from torch.fx.node import Node
+ 
++from executorch.backends.mlx import native_affine_lowering as _native_affine_lowering  # noqa: F401,E402
++
+ _LEAKY_RELU_DEFAULT_NEGATIVE_SLOPE = 0.01
+ 
+ 
+diff --git a/backends/mlx/runtime/MLXBackend.cpp b/backends/mlx/runtime/MLXBackend.cpp
+index 615c4f1..a257b18 100644
+--- a/backends/mlx/runtime/MLXBackend.cpp
++++ b/backends/mlx/runtime/MLXBackend.cpp
+@@ -12,7 +12,15 @@
+ #include "MLXInterpreter.h"
+ #include "MLXLoader.h"
+ #include "MLXSequenceCache.h"
++#include "MLXPositionProof.h"
++#include "MLXNativeLlamaPrefill.h"
++#include "MLXNativeNeoXPrefill.h"
++#include "MLXNativeGraniteMoEPrefill.h"
+ #include "mlx_mutable_state.h"
++#include "resident_prefill.h"
++#include "resident_greedy.h"
++#include "resident_features.h"
++#include "resident_attention_labels.h"
+ 
+ #include <executorch/extension/llm/cache/cache_registry.h>
+ 
+@@ -27,12 +35,21 @@
+ #include <executorch/backends/mlx/runtime/backend_options.h>
+ 
+ #include <cstring>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ #include <limits>
+ #include <memory>
+ #include <mutex>
+ 
+ #include <TargetConditionals.h>
+ 
++#if defined(ET_MLX_ENABLE_CPU) && ET_MLX_ENABLE_CPU
++#include <mlx/scheduler.h>
++#include <Accelerate/Accelerate.h>
++#endif
++
+ namespace executorch {
+ namespace backends {
+ namespace mlx {
+@@ -58,6 +75,340 @@ using ::mlx::core::Dtype;
+ using ::mlx::core::eval;
+ 
+ namespace {
++thread_local ResidentPrefillSubmission* resident_prefill_submission = nullptr;
++thread_local NativeLlamaPrefillScope* native_llama_prefill_scope = nullptr;
++thread_local ResidentFeatureScope* resident_feature_scope = nullptr;
++thread_local ResidentAttentionLabelScope* resident_attention_label_scope = nullptr;
++thread_local ResidentGreedyOutputScope* resident_greedy_output_scope = nullptr;
++thread_local ResidentGreedySubmissionScope* resident_greedy_submission_scope = nullptr;
++thread_local ResidentMoEPolicyScope* resident_moe_policy_scope = nullptr;
++}
++
++ResidentGreedyOutputScope::ResidentGreedyOutputScope(
++    MLXCache* expected_cache, int vocabulary)
++    : cache_(expected_cache), vocabulary_(vocabulary) {
++  if (!cache_ || vocabulary_ <= 0 || resident_greedy_output_scope) {
++    throw std::invalid_argument("resident greedy: invalid or nested scope");
++  }
++  resident_greedy_output_scope = this;
++}
++ResidentGreedyOutputScope::~ResidentGreedyOutputScope() {
++  resident_greedy_output_scope = nullptr;
++}
++ResidentGreedyOutputScope* ResidentGreedyOutputScope::current() {
++  return resident_greedy_output_scope;
++}
++void ResidentGreedyOutputScope::begin_invocation() {
++  // A repeated delegate call cannot expose the first call's successful result.
++  completed_ = false;
++  result_ = {};
++  if (invoked_) throw std::runtime_error("resident greedy: repeated delegate invocation");
++  invoked_ = true;
++}
++void ResidentGreedyOutputScope::finish(ResidentGreedyResult result) {
++  if (!invoked_ || completed_ || result.vocabulary != vocabulary_ ||
++      result.token < 0 || result.token >= vocabulary_) {
++    throw std::runtime_error("resident greedy: invalid completion result");
++  }
++  result_ = result;
++  completed_ = true;
++}
++void ResidentGreedyOutputScope::fail() noexcept {
++  completed_ = false;
++  result_ = {};
++}
++ResidentGreedyResult ResidentGreedyOutputScope::result() const {
++  if (!completed_) throw std::runtime_error("resident greedy: result not completed");
++  return result_;
++}
++
++ResidentAttentionLabelScope::ResidentAttentionLabelScope(
++    MLXCache* expected_cache, ResidentAttentionLabelConfig config, Callback on_ticket)
++    : cache_(expected_cache), config_(std::move(config)), on_ticket_(std::move(on_ticket)) {
++  if (!cache_ || resident_attention_label_scope || resident_feature_scope || !on_ticket_ ||
++      config_.block_tokens != 64 || config_.layers.empty())
++    throw std::invalid_argument("resident attention labels: invalid or nested scope");
++  for (size_t i = 0; i < config_.layers.size(); ++i) {
++    if (config_.layers[i] < 0 ||
++        std::find(config_.layers.begin(), config_.layers.begin() + i, config_.layers[i]) != config_.layers.begin() + i)
++      throw std::invalid_argument("resident attention labels: invalid or repeated selected layer");
++  }
++  resident_attention_label_scope = this;
++}
++ResidentAttentionLabelScope::~ResidentAttentionLabelScope() {
++  resident_attention_label_scope = nullptr;
++}
++ResidentAttentionLabelScope* ResidentAttentionLabelScope::current() {
++  return resident_attention_label_scope;
++}
++void ResidentAttentionLabelScope::publish(std::shared_ptr<AttentionLabelTicket> ticket) const {
++  on_ticket_(std::move(ticket));
++}
++
++ResidentFeatureScope::ResidentFeatureScope(
++    MLXCache* expected_cache, ResidentFeatureConfig config, Callback on_ticket)
++    : cache_(expected_cache), config_(std::move(config)), on_ticket_(std::move(on_ticket)) {
++  if (!cache_ || resident_feature_scope || !on_ticket_ || config_.block_tokens <= 0 || config_.layers.empty()) {
++    throw std::invalid_argument("resident features: invalid or nested scope");
++  }
++  for (size_t i = 0; i < config_.layers.size(); ++i) {
++    if (config_.layers[i] < 0 ||
++        std::find(config_.layers.begin(), config_.layers.begin() + i, config_.layers[i]) != config_.layers.begin() + i) {
++      throw std::invalid_argument("resident features: invalid or repeated layer");
++    }
++  }
++  resident_feature_scope = this;
++}
++ResidentFeatureScope::~ResidentFeatureScope() {
++  resident_feature_scope = nullptr;
++}
++ResidentFeatureScope* ResidentFeatureScope::current() {
++  return resident_feature_scope;
++}
++void ResidentFeatureScope::publish(std::shared_ptr<FeatureTicket> ticket) const {
++  on_ticket_(std::move(ticket));
++}
++
++void validate_native_model_configuration(const NativeModelConfig& config) {
++  if (!is_native_moe_policy_architecture(config.architecture) &&
++      (config.quantization_layout != NativeQuantizationLayout::Uniform ||
++       config.num_experts != 0 || config.experts_per_token != 0 ||
++       config.embedding_multiplier != 1 || config.residual_multiplier != 1 ||
++       config.attention_multiplier != 1 || config.logits_scaling != 1)) {
++    throw std::runtime_error("MoE/scaling configuration is unsupported by this native architecture");
++  }
++  switch (config.architecture) {
++    case NativeModelArchitecture::StandardLlamaTied:
++      NativeLlamaPrefill::validate_config(config); break;
++    case NativeModelArchitecture::GPTNeoXParallel:
++      NativeNeoXPrefill::validate_config(config); break;
++    case NativeModelArchitecture::GraniteMoE:
++    case NativeModelArchitecture::OLMoE:
++      NativeGraniteMoEPrefill::validate_config(config); break;
++    default: throw std::runtime_error("unsupported native model architecture");
++  }
++}
++
++NativeLlamaPrefillScope::NativeLlamaPrefillScope(
++    MLXCache* cache, NativeLlamaPrefillConfig config, int active_tokens)
++    : cache_(cache), config_(config), active_tokens_(active_tokens) {
++  if (!cache || native_llama_prefill_scope || resident_prefill_submission || active_tokens < 0) {
++    throw std::runtime_error("native prefill: null cache or nested/out-of-order scope");
++  }
++  validate_native_model_configuration(config_);
++  native_llama_prefill_scope = this;
++}
++void NativeLlamaPrefillScope::mark_active_tokens_dispatched() {
++  if (active_tokens_ <= 0 || active_tokens_dispatched_)
++    throw std::runtime_error("native Llama partial prefill: invalid/repeated final call");
++  active_tokens_dispatched_ = true;
++}
++NativeLlamaPrefillScope::~NativeLlamaPrefillScope() {
++  native_llama_prefill_scope = nullptr;
++}
++NativeLlamaPrefillScope* NativeLlamaPrefillScope::current() {
++  return native_llama_prefill_scope;
++}
++
++ResidentPrefillSubmission::ResidentPrefillSubmission(MLXCache* cache, bool allow_partial_native)
++    : cache_(cache), allow_partial_native_(allow_partial_native) {
++  if (!cache || resident_prefill_submission) {
++    throw std::runtime_error("resident prefill: null cache or nested submission");
++  }
++  resident_prefill_submission = this;
++}
++ResidentPrefillSubmission::~ResidentPrefillSubmission() {
++  resident_prefill_submission = nullptr;
++}
++ResidentPrefillSubmission* ResidentPrefillSubmission::current() {
++  return resident_prefill_submission;
++}
++void ResidentPrefillSubmission::mark_submitted() {
++  if (submitted_) throw std::runtime_error("resident prefill: repeated delegate invocation");
++  submitted_ = true;
++}
++
++namespace {
++
++using PrefillTimingClock = std::chrono::steady_clock;
++bool prefill_timing_enabled() {
++  const char* value = std::getenv("TRIFUSE_PREFILL_TIMING");
++  return value && std::strcmp(value, "1") == 0;
++}
++void prefill_timing(
++    const char* stage, PrefillTimingClock::time_point start,
++    int stream, int position, size_t tokens, bool cache_only) {
++  const double wall_ms = std::chrono::duration<double, std::milli>(
++      PrefillTimingClock::now() - start).count();
++  // Host wall time only. async-submit does not imply GPU completion.
++  std::fprintf(stderr,
++      "TRIFUSE_PREFILL_TIMING backend stage=%s stream=%d position=%d "
++      "tokens=%zu cache_only=%d wall_ms=%.6f\n",
++      stage, stream, position, tokens, int(cache_only), wall_ms);
++  std::fflush(stderr);
++}
++
++struct KVAddressSnapshot {
++  std::vector<std::uintptr_t> addresses;
++  size_t incomplete = 0;
++};
++
++// Caller holds mlx_global_mutex(). Read only completed canonical K/V roots;
++// is_available() does not submit or wait. On Metal, data<void>() just obtains
++// the shared buffer's contents address, without reading its payload. Only
++// integers escape this helper: the temporary array references must be gone
++// before native graph construction, or this diagnostic could inhibit donation.
++KVAddressSnapshot snapshot_kv_addresses_locked(
++    const MLXSequenceCache& cache, size_t expected_roots) {
++  KVAddressSnapshot snapshot;
++  snapshot.addresses.resize(expected_roots, 0);
++  const auto roots = cache.storage_roots(); // Layer order: K0, V0, K1, V1, ...
++  if (roots.size() == expected_roots) {
++    for (size_t i = 0; i < roots.size(); ++i) {
++      if (roots[i].is_available()) {
++        snapshot.addresses[i] = reinterpret_cast<std::uintptr_t>(roots[i].data<void>());
++      }
++    }
++  }
++  // If a pool is unallocated, storage_roots omits it; do not guess which layer
++  // the remaining entries belong to. Count all slots as incomplete instead.
++  for (const auto address : snapshot.addresses) {
++    if (address == 0) ++snapshot.incomplete;
++  }
++  return snapshot;
++}
++
++void trace_kv_address_reuse(
++    const KVAddressSnapshot& before, const KVAddressSnapshot& after,
++    int stream, int position, size_t tokens) {
++  size_t matching = 0;
++  size_t incomplete = 0;
++  for (size_t i = 0; i < before.addresses.size(); ++i) {
++    const auto old_address = before.addresses[i];
++    const auto new_address = after.addresses[i];
++    if (old_address == 0 || new_address == 0) ++incomplete;
++    else if (old_address == new_address) ++matching;
++  }
++  // Address reuse only: neither a copy-byte counter nor proof that no copies
++  // occurred. Incomplete slots are excluded from matching, never read/waited.
++  std::fprintf(stderr,
++      "TRIFUSE_PREFILL_TIMING backend stage=greedy_kv_address_reuse "
++      "stream=%d position=%d tokens=%zu cache_only=0 matching=%zu total=%zu "
++      "incomplete=%zu before_incomplete=%zu after_incomplete=%zu\n",
++      stream, position, tokens, matching, before.addresses.size(), incomplete,
++      before.incomplete, after.incomplete);
++  std::fflush(stderr);
++}
++
++enum class CPUBlasThreading { Default, Single, Multi };
++
++#if defined(ET_MLX_ENABLE_CPU) && ET_MLX_ENABLE_CPU
++const char* blas_threading_name(CPUBlasThreading policy) {
++  switch (policy) {
++    case CPUBlasThreading::Single:
++      return "single";
++    case CPUBlasThreading::Multi:
++      return "multi";
++    default:
++      return "default";
++  }
++}
++#endif
++
++CPUBlasThreading read_blas_threading(
++    BackendInitContext& context,
++    ::mlx::core::Device device) {
++  const auto spec =
++      context.get_runtime_spec<const char*>(kCPUBlasThreadingKey);
++  if (!spec.ok()) {
++    if (spec.error() == Error::NotFound) {
++      return CPUBlasThreading::Default;
++    }
++    throw std::invalid_argument("MLX cpu_blas_threading must be a string");
++  }
++  if (!(device == ::mlx::core::Device::cpu)) {
++    throw std::invalid_argument("MLX cpu_blas_threading requires device='cpu'");
++  }
++  const char* value = spec.get();
++  if (value && std::strcmp(value, "default") == 0) {
++    return CPUBlasThreading::Default;
++  }
++  if (value && std::strcmp(value, "single") == 0) {
++    return CPUBlasThreading::Single;
++  }
++  if (value && std::strcmp(value, "multi") == 0) {
++    return CPUBlasThreading::Multi;
++  }
++  throw std::invalid_argument(
++      "MLX cpu_blas_threading must be exactly 'default', 'single', or 'multi'");
++}
++
++void configure_cpu_blas(
++    const ::mlx::core::Stream& stream,
++    CPUBlasThreading policy) {
++#if defined(ET_MLX_ENABLE_CPU) && ET_MLX_ENABLE_CPU
++  if (__builtin_available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *)) {
++    struct Readback {
++      int setter_result{0};
++      bool setter_called{false};
++      bool completed{false};
++      int actual{-1};
++    };
++    auto result = std::make_shared<Readback>();
++    // Accelerate's policy is thread-local. CPU matmul dispatches on this same
++    // per-stream scheduler worker, not the thread that loads or executes ET.
++    ::mlx::core::scheduler::enqueue(stream, [result, policy]() {
++      if (policy != CPUBlasThreading::Default) {
++        result->setter_called = true;
++        result->setter_result = BLASSetThreading(
++            policy == CPUBlasThreading::Single
++                ? BLAS_THREADING_SINGLE_THREADED
++                : BLAS_THREADING_MULTI_THREADED);
++      }
++      result->actual = static_cast<int>(BLASGetThreading());
++      result->completed = true;
++    });
++    // Waits for a queue marker after the readback and checks worker errors.
++    // The task owns its result even if enqueue/synchronize throws.
++    ::mlx::core::synchronize(stream);
++    const int expected = policy == CPUBlasThreading::Single
++        ? static_cast<int>(BLAS_THREADING_SINGLE_THREADED)
++        : static_cast<int>(BLAS_THREADING_MULTI_THREADED);
++    const bool known =
++        result->actual == static_cast<int>(BLAS_THREADING_SINGLE_THREADED) ||
++        result->actual == static_cast<int>(BLAS_THREADING_MULTI_THREADED);
++    const bool verified = result->completed && result->setter_result == 0 &&
++        known && (policy == CPUBlasThreading::Default || result->actual == expected);
++    const char* progress = std::getenv("TRIFUSE_RESIDENT_PROGRESS");
++    if (progress && std::strcmp(progress, "1") == 0) {
++      std::printf(
++          "TRIFUSE_CPU_BLAS stream=%d requested=%s actual=%s "
++          "setter_called=%d setter_result=%d worker_readback_verified=%d\n",
++          stream.index,
++          blas_threading_name(policy),
++          !known ? "unknown" : (result->actual == static_cast<int>(
++              BLAS_THREADING_SINGLE_THREADED) ? "single" : "multi"),
++          result->setter_called,
++          result->setter_result,
++          verified);
++      std::fflush(stdout);
++    }
++    if (!verified) {
++      throw std::runtime_error("MLX CPU worker BLAS threading readback failed");
++    }
++    return;
++  }
++  if (policy != CPUBlasThreading::Default) {
++    throw std::runtime_error(
++        "MLX CPU BLAS threading requires macOS 15 / iOS 18 or newer");
++  }
++#else
++  (void)stream;
++  (void)policy;
++  throw std::runtime_error(
++      "MLX CPU BLAS options require EXECUTORCH_MLX_ENABLE_CPU=ON");
++#endif
++}
+ 
+ array tensor_to_mlx(
+     const ETTensor& t,
+@@ -91,9 +442,9 @@ array tensor_to_mlx(
+     shape.push_back(static_cast<int>(dim_size));
+   }
+ 
+-  // SAFETY: MLX reads this data during async_eval() Metal command encoding,
+-  // which completes before the lock is released. The ET tensor must remain
+-  // valid until async_eval returns.
++  // This may wrap external input storage. The resident caller retains every
++  // ET input until synchronous output/storage completion, including across
++  // cache-only submissions; async_eval returning is not a lifetime boundary.
+   const void* cptr = t.const_data_ptr();
+   if (!cptr) {
+     throw std::runtime_error("tensor_to_mlx: tensor has null data pointer");
+@@ -170,13 +521,33 @@ void write_output(array& arr, ETTensor& out) {
+ 
+ } // namespace
+ 
++// Owned by the handle, not a local output temporary: a failed submission/wait
++// leaves these arrays alive with the resident Core's unknown-completion
++// quarantine. All creation and successful cleanup occurs under the graph lock.
++struct ResidentGreedyStorage {
++  // int64 token and bool finite; unaudited architectures additionally retain
++  // every K/V root as an explicit output of the same submission.
++  std::vector<array> roots;
++  std::vector<::mlx::core::Event> completions;
++};
++
+ struct MLXHandle {
+   MLXProgram program;
++  // Members are destroyed in reverse order. Declare the source leases before
++  // constants/state/native views so mapped bytes outlive every dependent array.
++  std::vector<FreeableBuffer> constant_buffers;
+   ConstantData constants;
+   MutableBufferData mutable_buffers;
+   ExecutionState state; // Reusable execution state
+   Interpreter interpreter;
+-  ::mlx::core::Stream stream; // Dedicated GPU stream for this handle
++  std::optional<InputPositionProof> position_proof;
++  bool position_proof_checked = false;
++  std::unique_ptr<NativeLlamaPrefill> native_prefill;
++  std::unique_ptr<NativeNeoXPrefill> native_neox;
++  std::unique_ptr<NativeGraniteMoEPrefill> native_granite_moe;
++  ops::CompiledSilu native_prefill_silu;
++  std::unique_ptr<ResidentGreedyStorage> greedy_output;
++  ::mlx::core::Stream stream; // Dedicated selected-device stream for this handle
+ 
+   // Periodically call mlx::core::clear_cache() every N execute() calls to
+   // release MLX's cached buffer pool. 0 disables. Counter is non-atomic: it is
+@@ -189,16 +560,11 @@ struct MLXHandle {
+   // even if the runner's session is torn down first.
+   std::shared_ptr<::executorch::extension::llm::cache::CacheBase> cache_shared;
+ 
+-  // Keep the constant buffers alive for zero-copy constants
+-  // Each FreeableBuffer must outlive the MLX arrays that reference it
+-  std::vector<FreeableBuffer> constant_buffers;
+-
+   // Delegate handles may be loaded on one host thread and executed on another.
+   // Module forbids concurrent use of a handle, and mlx_global_mutex()
+   // serializes graph construction and command submission across handles.
+-  MLXHandle()
+-      : stream(
+-            ::mlx::core::new_thread_unsafe_stream(::mlx::core::Device::gpu)) {}
++  explicit MLXHandle(::mlx::core::Device device)
++      : stream(::mlx::core::new_thread_unsafe_stream(device)) {}
+   ~MLXHandle() = default;
+ 
+   MLXHandle(const MLXHandle&) = delete;
+@@ -214,6 +580,365 @@ static std::mutex& mlx_global_mutex() {
+   return m;
+ }
+ 
++struct ResidentMoEPolicyContext::Storage {
++  MLXCache* cache;
++  ::mlx::core::Stream stream;
++  explicit Storage(MLXCache* owner)
++      : cache(owner), stream(::mlx::core::new_thread_unsafe_stream(::mlx::core::Device::gpu)) {}
++};
++ResidentMoEPolicyContext::ResidentMoEPolicyContext(MLXCache* cache) {
++  if (!cache) throw std::invalid_argument("MoE policy: null cache");
++  std::lock_guard<std::mutex> lock(mlx_global_mutex());
++  auto* sequence = dynamic_cast<MLXSequenceCache*>(cache);
++  if (!sequence || !sequence->has_full_history_storage() || sequence->has_attention_selection() ||
++      sequence->attention_selection_layer_calls() || !::mlx::core::is_available(::mlx::core::Device::gpu)) {
++    throw std::invalid_argument("MoE policy: full-history GPU cache required");
++  }
++  storage_ = std::make_unique<Storage>(cache);
++}
++ResidentMoEPolicyContext::~ResidentMoEPolicyContext() {
++  std::lock_guard<std::mutex> lock(mlx_global_mutex());
++  storage_.reset();
++}
++void ResidentMoEPolicyContext::synchronize() {
++  std::lock_guard<std::mutex> lock(mlx_global_mutex());
++  ::mlx::core::synchronize(storage_->stream);
++}
++ResidentMoEPolicyScope::ResidentMoEPolicyScope(std::shared_ptr<ResidentMoEPolicyContext> context)
++    : context_(std::move(context)) {
++  if (!context_ || resident_moe_policy_scope)
++    throw std::invalid_argument("MoE policy: null or nested scope");
++  resident_moe_policy_scope = this;
++}
++ResidentMoEPolicyScope::~ResidentMoEPolicyScope() {
++  resident_moe_policy_scope = nullptr;
++}
++ResidentMoEPolicyScope* ResidentMoEPolicyScope::current() {
++  return resident_moe_policy_scope;
++}
++
++struct ResidentGreedyTicket::Storage {
++  MLXCache* cache = nullptr;
++  int vocabulary = 0, next_position = 0, stream_index = -1;
++  std::optional<array> token;
++  ::mlx::core::Event completion;
++  std::shared_ptr<void> input_lease;
++  bool sealed = false;
++};
++ResidentGreedyTicket::ResidentGreedyTicket() : storage_(std::make_unique<Storage>()) {}
++ResidentGreedyTicket::~ResidentGreedyTicket() {
++  std::shared_ptr<void> lease;
++  {
++    std::lock_guard<std::mutex> lock(mlx_global_mutex());
++    lease = std::move(storage_->input_lease);
++    storage_.reset();
++  }
++}
++int64_t ResidentGreedyTicket::wait_token() const {
++  ::mlx::core::Event completion;
++  {
++    std::lock_guard<std::mutex> lock(mlx_global_mutex());
++    if (!storage_->sealed || !storage_->token) throw std::runtime_error("greedy ticket: unsubmitted prediction");
++    completion = storage_->completion;
++  }
++  if (completion.valid()) completion.wait();
++  std::lock_guard<std::mutex> lock(mlx_global_mutex());
++  storage_->token->wait();
++  const auto& token = *storage_->token;
++  if (token.dtype() != ::mlx::core::int64 || token.size() != 1 || !token.data<int64_t>())
++    throw std::runtime_error("greedy ticket: invalid scalar");
++  const int64_t value = *token.data<int64_t>();
++  if (value < 0 || value >= storage_->vocabulary)
++    throw std::runtime_error("greedy ticket: nonfinite logits or token outside vocabulary");
++  return value;
++}
++ResidentGreedySubmissionScope::ResidentGreedySubmissionScope(
++    MLXCache* cache, int vocabulary, int position,
++    std::shared_ptr<ResidentGreedyTicket> input, std::shared_ptr<void> input_lease, bool initial_prediction)
++    : cache_(cache), vocabulary_(vocabulary), position_(position),
++      initial_prediction_(initial_prediction), input_(std::move(input)),
++      output_(new ResidentGreedyTicket()), input_lease_(std::move(input_lease)) {
++  if (!cache_ || vocabulary_ <= 0 || position_ < 0 || !input_lease_ ||
++      (initial_prediction_ && input_) ||
++      resident_greedy_submission_scope || resident_greedy_output_scope)
++    throw std::invalid_argument("greedy submission: invalid/nested scope");
++  resident_greedy_submission_scope = this;
++}
++ResidentGreedySubmissionScope::~ResidentGreedySubmissionScope() {
++  resident_greedy_submission_scope = nullptr;
++}
++ResidentGreedySubmissionScope* ResidentGreedySubmissionScope::current() {
++  return resident_greedy_submission_scope;
++}
++std::shared_ptr<ResidentGreedyTicket> ResidentGreedySubmissionScope::submitted_ticket() const {
++  if (!invoked_ || !output_ || !output_->storage_->sealed)
++    throw std::runtime_error("greedy submission: missing submitted ticket");
++  return output_;
++}
++void clear_greedy_allocator_cache() {
++  std::lock_guard<std::mutex> lock(mlx_global_mutex());
++  ::mlx::core::clear_cache();
++}
++
++void drain_submitted_work() {
++  std::lock_guard<std::mutex> lock(mlx_global_mutex());
++  const auto streams = ::mlx::core::get_streams();
++  for (const auto& stream : streams) {
++    ::mlx::core::synchronize(stream);
++  }
++}
++
++IdleMemoryMaintenance reclaim_idle_memory(std::optional<size_t> cache_limit) {
++  const auto started = std::chrono::steady_clock::now();
++  std::lock_guard<std::mutex> lock(mlx_global_mutex());
++  const auto drain_started = std::chrono::steady_clock::now();
++  const auto streams = ::mlx::core::get_streams();
++  for (const auto& stream : streams) {
++    ::mlx::core::synchronize(stream);
++  }
++  IdleMemoryMaintenance result{};
++  result.drain_ms = std::chrono::duration<double, std::milli>(
++      std::chrono::steady_clock::now() - drain_started).count();
++  result.synchronized_streams = streams.size();
++  result.active_before = ::mlx::core::get_active_memory();
++  result.cached_before = ::mlx::core::get_cache_memory();
++  result.peak_before = ::mlx::core::get_peak_memory();
++  const auto reclaim_started = std::chrono::steady_clock::now();
++  try {
++    if (cache_limit) {
++      result.previous_cache_limit = ::mlx::core::set_cache_limit(*cache_limit);
++    }
++    ::mlx::core::clear_cache();
++    result.reclaim_ms = std::chrono::duration<double, std::milli>(
++        std::chrono::steady_clock::now() - reclaim_started).count();
++    result.active_after = ::mlx::core::get_active_memory();
++    result.cached_after = ::mlx::core::get_cache_memory();
++    result.peak_after = ::mlx::core::get_peak_memory();
++  } catch (...) {
++    if (result.previous_cache_limit) {
++      ::mlx::core::set_cache_limit(*result.previous_cache_limit);
++    }
++    throw;
++  }
++  result.wall_ms = std::chrono::duration<double, std::milli>(
++      std::chrono::steady_clock::now() - started).count();
++  return result;
++}
++
++size_t restore_idle_cache_limit(size_t limit) {
++  std::lock_guard<std::mutex> lock(mlx_global_mutex());
++  return ::mlx::core::set_cache_limit(limit);
++}
++
++namespace {
++// Only this payload holds MLX arrays. It is created/populated and destroyed
++// under mlx_global_mutex; GPU completion is waited outside that mutex.
++struct FeaturePayload {
++  FeatureBatch batch;
++  std::optional<array> summary;
++  ::mlx::core::Event completion;
++  bool submission_started = false;
++  bool sealed = false;
++  bool completion_known = false;
++  bool failed = false;
++};
++
++class SubmittedFeatureTicket final : public FeatureTicket {
++ public:
++  SubmittedFeatureTicket() : payload_(std::make_unique<FeaturePayload>()) {}
++  ~SubmittedFeatureTicket() override {
++    std::lock_guard<std::mutex> lock(mlx_global_mutex());
++    if (payload_ && payload_->submission_started && !payload_->completion_known) {
++      const auto& event = payload_->completion;
++      const auto* error = event.load_error();
++      if (payload_->failed || !payload_->sealed ||
++          (event.valid() && (!event.is_signaled() || (error && error->valid())))) {
++        // No implicit GPU wait or unsafe release on queue abandonment/error.
++        // The surrounding resident owner separately retains its inputs/cache.
++        (void)payload_.release();
++        return;
++      }
++    }
++    payload_.reset();
++  }
++
++  // Producer-only methods: caller holds mlx_global_mutex until seal_locked.
++  void configure_locked(int start, int count, const ResidentFeatureConfig& config) {
++    payload_->batch.absolute_start = start;
++    payload_->batch.token_count = count;
++    payload_->batch.block_tokens = config.block_tokens;
++    payload_->batch.layers = config.layers;
++  }
++  std::optional<array>& summary_locked() { return payload_->summary; }
++  void begin_submission_locked() { payload_->submission_started = true; }
++  void seal_locked() {
++    if (!payload_->summary || !payload_->submission_started) {
++      throw std::runtime_error("resident features: missing submitted summary");
++    }
++    const auto& summary = *payload_->summary;
++    const auto& batch = payload_->batch;
++    const ::mlx::core::Shape shape{int(batch.layers.size()), batch.token_count / batch.block_tokens,
++                                    int(FeatureBatch::feature_count)};
++    if (summary.shape() != shape || summary.dtype() != ::mlx::core::float32 ||
++        !summary.flags().row_contiguous || summary.status() == array::Status::unscheduled) {
++      throw std::runtime_error("resident features: submitted summary ABI differs");
++    }
++    payload_->completion = summary.event();
++    if (!payload_->completion.valid() && summary.status() != array::Status::available) {
++      throw std::runtime_error("resident features: missing completion event");
++    }
++    payload_->sealed = true;
++  }
++
++  FeatureBatch wait_and_read() override {
++    std::lock_guard<std::mutex> reader_lock(reader_mutex_);
++    if (read_started_) throw std::runtime_error("resident features: ticket already consumed");
++    read_started_ = true;
++    try {
++      ::mlx::core::Event event;
++      {
++        std::lock_guard<std::mutex> lock(mlx_global_mutex());
++        if (!payload_->sealed) throw std::runtime_error("resident features: ticket not submitted");
++        event = payload_->completion;
++      }
++      // Event::wait checks asynchronous errors before/after waiting, even if
++      // already signaled. Do not rely on is_signaled alone as success proof.
++      if (event.valid()) event.wait();
++      std::lock_guard<std::mutex> lock(mlx_global_mutex());
++      auto& summary = *payload_->summary;
++      summary.wait(); // Event above completed; this only finalizes array state.
++      payload_->completion_known = true;
++      const float* data = summary.data<float>();
++      if (!data) throw std::runtime_error("resident features: missing FP32 summary bytes");
++      FeatureBatch result = payload_->batch;
++      result.values.assign(data, data + summary.size());
++      for (float value : result.values) {
++        if (!std::isfinite(value)) throw std::runtime_error("resident features: nonfinite summary");
++      }
++      payload_->summary.reset();
++      payload_->completion = ::mlx::core::Event{};
++      return result;
++    } catch (...) {
++      // If completion itself failed, keep the submitted arrays alive. The
++      // worker must surface this error to its resident request, never retry it.
++      payload_->failed = true;
++      throw;
++    }
++  }
++
++ private:
++  std::unique_ptr<FeaturePayload> payload_;
++  std::mutex reader_mutex_;
++  bool read_started_ = false;
++};
++
++// Independent optional T1 teacher summary. No Q/K or unaggregated attention is
++// copied to the host. As with FeaturePayload, MLX array lifetimes are protected
++// by the global graph mutex while waiting occurs outside it.
++struct AttentionLabelPayload {
++  AttentionLabelBatch batch;
++  std::optional<array> summary;
++  ::mlx::core::Event completion;
++  bool submission_started = false;
++  bool sealed = false;
++  bool completion_known = false;
++  bool failed = false;
++};
++
++class SubmittedAttentionLabelTicket final : public AttentionLabelTicket {
++ public:
++  SubmittedAttentionLabelTicket() : payload_(std::make_unique<AttentionLabelPayload>()) {}
++  ~SubmittedAttentionLabelTicket() override {
++    std::lock_guard<std::mutex> lock(mlx_global_mutex());
++    if (payload_ && payload_->submission_started && !payload_->completion_known) {
++      const auto& event = payload_->completion;
++      const auto* error = event.load_error();
++      if (payload_->failed || !payload_->sealed ||
++          (event.valid() && (!event.is_signaled() || (error && error->valid())))) {
++        // Owner admission bounds outstanding tickets. An abandoned or failed
++        // submission must not trigger an implicit wait or unsafe graph release.
++        (void)payload_.release();
++        return;
++      }
++    }
++    payload_.reset();
++  }
++
++  void configure_locked(int query_position, const NativeLlamaPrefillConfig& geometry,
++                        const ResidentAttentionLabelConfig& config) {
++    config.validate_for(geometry.layers, 1);
++    if (query_position < 0 || query_position >= geometry.capacity ||
++        query_position == std::numeric_limits<int>::max())
++      throw std::runtime_error("resident attention labels: invalid absolute query position");
++    auto& batch = payload_->batch;
++    batch.query_position = query_position;
++    batch.covered_length = query_position + 1;
++    batch.full_length = query_position + 1;
++    batch.block_tokens = config.block_tokens;
++    batch.block_count = 1 + query_position / config.block_tokens;
++    batch.query_heads = geometry.query_heads;
++    batch.kv_heads = geometry.kv_heads;
++    batch.head_dim = geometry.head_dim;
++    batch.layers = config.layers;
++  }
++  std::optional<array>& summary_locked() { return payload_->summary; }
++  void begin_submission_locked() { payload_->submission_started = true; }
++  void seal_locked() {
++    if (!payload_->summary || !payload_->submission_started)
++      throw std::runtime_error("resident attention labels: missing submitted summary");
++    const auto& summary = *payload_->summary;
++    const auto& batch = payload_->batch;
++    const ::mlx::core::Shape expected{int(batch.layers.size()), batch.kv_heads, batch.block_count};
++    if (summary.shape() != expected || summary.dtype() != ::mlx::core::float32 ||
++        !summary.flags().row_contiguous || summary.status() == array::Status::unscheduled)
++      throw std::runtime_error("resident attention labels: submitted summary ABI differs");
++    payload_->completion = summary.event();
++    if (!payload_->completion.valid() && summary.status() != array::Status::available)
++      throw std::runtime_error("resident attention labels: missing completion event");
++    payload_->sealed = true;
++  }
++
++  AttentionLabelBatch wait_and_read() override {
++    std::lock_guard<std::mutex> reader_lock(reader_mutex_);
++    if (read_started_) throw std::runtime_error("resident attention labels: ticket already consumed");
++    read_started_ = true;
++    try {
++      ::mlx::core::Event event;
++      {
++        std::lock_guard<std::mutex> lock(mlx_global_mutex());
++        if (!payload_->sealed) throw std::runtime_error("resident attention labels: ticket not submitted");
++        event = payload_->completion;
++      }
++      if (event.valid()) event.wait(); // propagates asynchronous errors
++      std::lock_guard<std::mutex> lock(mlx_global_mutex());
++      auto& summary = *payload_->summary;
++      summary.wait(); // completed event; only finalizes array state
++      payload_->completion_known = true;
++      const float* data = summary.data<float>();
++      if (!data) throw std::runtime_error("resident attention labels: missing FP32 summary bytes");
++      AttentionLabelBatch result = payload_->batch;
++      result.values.assign(data, data + summary.size());
++      for (float value : result.values) {
++        if (!std::isfinite(value) || value < 0)
++          throw std::runtime_error("resident attention labels: invalid block score");
++      }
++      payload_->summary.reset();
++      payload_->completion = ::mlx::core::Event{};
++      return result;
++    } catch (...) {
++      std::lock_guard<std::mutex> lock(mlx_global_mutex());
++      payload_->failed = true;
++      throw;
++    }
++  }
++
++ private:
++  std::unique_ptr<AttentionLabelPayload> payload_;
++  std::mutex reader_mutex_;
++  bool read_started_ = false;
++};
++} // namespace
++
+ class MLXBackend final : public ::executorch::runtime::BackendInterface {
+  public:
+   ~MLXBackend() override = default;
+@@ -242,8 +967,33 @@ class MLXBackend final : public ::executorch::runtime::BackendInterface {
+       return Error::MemoryAllocationFailed;
+     }
+ 
++    bool handle_initialized = false;
+     try {
+-      new (handle) MLXHandle();
++      ::mlx::core::Device device{::mlx::core::Device::gpu};
++      const auto device_spec = context.get_runtime_spec<const char*>(kDeviceKey);
++      if (device_spec.ok()) {
++        const char* value = device_spec.get();
++        if (value != nullptr && std::strcmp(value, "cpu") == 0) {
++          device = ::mlx::core::Device{::mlx::core::Device::cpu};
++        } else if (value == nullptr || std::strcmp(value, "gpu") != 0) {
++          throw std::invalid_argument(
++              "MLX device option must be exactly 'cpu' or 'gpu'");
++        }
++      } else if (device_spec.error() != Error::NotFound) {
++        throw std::invalid_argument("MLX device option must be a string");
++      }
++      const auto blas_threading = read_blas_threading(context, device);
++      if (!::mlx::core::is_available(device)) {
++        throw std::runtime_error(
++            device == ::mlx::core::Device::cpu
++                ? "MLX CPU is unavailable; rebuild MLX with MLX_BUILD_CPU=ON"
++                : "MLX GPU is unavailable");
++      }
++      new (handle) MLXHandle(device);
++      handle_initialized = true;
++      if (device == ::mlx::core::Device::cpu) {
++        configure_cpu_blas(handle->stream, blas_threading);
++      }
+ 
+       // Per-model clear-cache cadence (optional runtime spec, keyed per
+       // delegate)
+@@ -289,7 +1039,8 @@ class MLXBackend final : public ::executorch::runtime::BackendInterface {
+           handle->program,
+           named_data_map,
+           handle->constants,
+-          handle->constant_buffers);
++          handle->constant_buffers,
++          device);
+ 
+       // Delegate payload no longer needed after constants are loaded
+       processed->Free();
+@@ -387,14 +1138,23 @@ class MLXBackend final : public ::executorch::runtime::BackendInterface {
+ 
+     } catch (const std::exception& e) {
+       ET_LOG(Error, "Failed to load MLX program: %s", e.what());
+-      handle->~MLXHandle();
++#if !ET_LOG_ENABLED
++      // iOS release archives may disable ExecuTorch logging. Preserve the
++      // underlying admission failure in the developer console in that case.
++      std::fprintf(stderr, "MLX program load failed: %s\n", e.what());
++#endif
++      if (handle_initialized) {
++        handle->~MLXHandle();
++      }
+       if (processed != nullptr) {
+         processed->Free();
+       }
+       return Error::InvalidProgram;
+     } catch (...) {
+       ET_LOG(Error, "Failed to load MLX program: unknown non-std exception");
+-      handle->~MLXHandle();
++      if (handle_initialized) {
++        handle->~MLXHandle();
++      }
+       if (processed != nullptr) {
+         processed->Free();
+       }
+@@ -409,7 +1169,30 @@ class MLXBackend final : public ::executorch::runtime::BackendInterface {
+       DelegateHandle* handle,
+       Span<EValue*> args) const override {
+     try {
+-      std::vector<array> prepared_outputs;
++      auto* greedy_scope = ResidentGreedyOutputScope::current();
++      if (greedy_scope) greedy_scope->begin_invocation();
++      auto* greedy_submission = ResidentGreedySubmissionScope::current();
++      if (greedy_submission) {
++        if (greedy_scope || greedy_submission->invoked_)
++          throw std::runtime_error("greedy submission: repeated/conflicting invocation");
++        greedy_submission->invoked_ = true;
++      }
++      // Declared outside the graph-lock lifetime: ticket release takes that
++      // mutex even if a partial graph/submission throws.
++      std::shared_ptr<ResidentGreedyTicket> submitted_prediction;
++      if (greedy_submission) submitted_prediction = greedy_submission->output_;
++      std::optional<ResidentGreedyResult> greedy_result;
++      bool greedy_kv_dependencies_covered = false;
++      struct LockedOutputArrays {
++        std::vector<array> values;
++        ~LockedOutputArrays() {
++          // Also runs after the graph lock unwinds on failure. Feature workers
++          // may be releasing their completed arrays concurrently.
++          std::lock_guard<std::mutex> lock(mlx_global_mutex());
++          values.clear();
++        }
++      } output_storage;
++      auto& prepared_outputs = output_storage.values;
+       struct OutputInfo {
+         size_t arg_idx;
+         size_t prepared_idx;
+@@ -420,11 +1203,50 @@ class MLXBackend final : public ::executorch::runtime::BackendInterface {
+ 
+       auto* h = static_cast<MLXHandle*>(handle);
+       const auto& program = h->program;
++      const bool trace_prefill = NativeLlamaPrefillScope::current() != nullptr &&
++          prefill_timing_enabled();
++      bool trace_granite_greedy = false;
++      KVAddressSnapshot kv_addresses_before;
++      int timing_position = -1;
++      size_t timing_tokens = 0;
++      bool timing_cache_only = false;
++      auto* feature_scope = ResidentFeatureScope::current();
++      auto* attention_label_scope = ResidentAttentionLabelScope::current();
++      // Keep the ticket outside the lock's lexical scope so exception cleanup
++      // never invokes its locking destructor while that mutex is held.
++      std::shared_ptr<SubmittedFeatureTicket> feature_ticket;
++      if (feature_scope) feature_ticket = std::make_shared<SubmittedFeatureTicket>();
++      std::shared_ptr<SubmittedAttentionLabelTicket> attention_label_ticket;
++      if (attention_label_scope)
++        attention_label_ticket = std::make_shared<SubmittedAttentionLabelTicket>();
++      bool cache_only_submitted = false;
+ 
+       // Graph construction + async GPU dispatch (locked)
+       {
+         std::lock_guard<std::mutex> lock(mlx_global_mutex());
+ 
++        struct RestoreStream {
++          ::mlx::core::Stream& destination;
++          ::mlx::core::Stream previous;
++          ~RestoreStream() { destination = previous; }
++        } restore_stream{h->stream, h->stream};
++        if (auto* policy = ResidentMoEPolicyScope::current()) {
++          const auto* native = NativeLlamaPrefillScope::current();
++          auto* sequence = dynamic_cast<MLXSequenceCache*>(h->state.cache);
++          const auto& policy_storage = *policy->context_->storage_;
++          if (!native || !is_native_moe_policy_architecture(native->config().architecture) ||
++              native->cache() != policy_storage.cache || h->state.cache != policy_storage.cache ||
++              !sequence || !sequence->has_complete_history_positions() || sequence->has_attention_selection() ||
++              sequence->attention_selection_layer_calls() || feature_scope || attention_label_scope ||
++              h->stream.device.type != ::mlx::core::Device::gpu || !program.mutable_buffer_map.empty()) {
++            throw std::runtime_error("MoE policy: matching native full-history GPU owner required");
++          }
++          h->stream = policy_storage.stream;
++        }
++
++        if (h->greedy_output) {
++          throw std::runtime_error("resident greedy: previous invocation did not complete");
++        }
+         h->state.reset();
+ 
+         const size_t n_inputs = program.input_map.size();
+@@ -482,9 +1304,304 @@ class MLXBackend final : public ::executorch::runtime::BackendInterface {
+           return rebind_err;
+         }
+ 
++        if (!h->position_proof_checked) {
++          h->position_proof = prove_input_positions(program);
++          h->position_proof_checked = true;
++        }
++        if (h->position_proof) {
++          const auto& proof = *h->position_proof;
++          const auto& input = args[proof.input_index]->toTensor();
++          if (!executorch::runtime::tensor_is_contiguous(input) ||
++              input.scalar_type() != static_cast<executorch::aten::ScalarType>(proof.scalar_type) ||
++              size_t(input.dim()) != proof.shape.size() || size_t(input.numel()) != proof.count) {
++            throw std::runtime_error("execute: position input differs from static proof");
++          }
++          for (size_t i = 0; i < proof.shape.size(); ++i) {
++            if (input.size(i) != proof.shape[i]) throw std::runtime_error("execute: position shape differs");
++          }
++          h->state.host_positions = proof.scalar_type == ScalarType::Long
++              ? copy_checked_host_positions(proof, input.const_data_ptr<int64_t>(), proof.count)
++              : copy_checked_host_positions(proof, input.const_data_ptr<int32_t>(), proof.count);
++        }
++
+         // Run the MLX program (builds lazy computation graph)
+-        h->interpreter.run(program, h->state, h->stream);
++        auto* prefill = ResidentPrefillSubmission::current();
++        auto* sequence_cache = dynamic_cast<MLXSequenceCache*>(h->state.cache);
++        std::unique_ptr<ResidentGreedyDeviceInput> greedy_device_input;
++        if (greedy_submission) {
++          const auto* native = NativeLlamaPrefillScope::current();
++          if (!native || !is_native_moe_policy_architecture(native->config().architecture) ||
++              native->cache() != greedy_submission->cache_ || h->state.cache != greedy_submission->cache_ ||
++              !sequence_cache || !sequence_cache->has_complete_history_positions() ||
++              sequence_cache->has_attention_selection() || sequence_cache->attention_selection_layer_calls() ||
++              h->stream.device.type != ::mlx::core::Device::gpu || prefill || feature_scope || attention_label_scope ||
++              native->active_tokens() || native->config().vocabulary != greedy_submission->vocabulary_ ||
++              !program.mutable_buffer_map.empty() || program.input_map.size() != 2 || program.output_map.size() != 1 ||
++              program.input_map.front().slot_type != SlotType::TensorSlot ||
++              program.output_map.front().slot_type != SlotType::TensorSlot ||
++              !h->state.host_positions || h->state.host_positions->size() != 1 ||
++              h->state.host_positions->front() != greedy_submission->position_ ||
++              sequence_cache->length() != greedy_submission->position_)
++            throw std::runtime_error("greedy submission: mismatched full-history Granite owner/T1");
++          if (greedy_submission->input_) {
++            const auto& input = *greedy_submission->input_->storage_;
++            if (!input.sealed || !input.token || input.cache != sequence_cache ||
++                input.vocabulary != greedy_submission->vocabulary_ || input.stream_index != h->stream.index ||
++                input.next_position != greedy_submission->position_)
++              throw std::runtime_error("greedy submission: stale/foreign prediction ticket");
++            auto safe = ::mlx::core::reshape(::mlx::core::maximum(*input.token,
++                array(int64_t(0), ::mlx::core::int64), h->stream), {1, 1}, h->stream);
++            greedy_device_input.reset(new ResidentGreedyDeviceInput(std::move(safe)));
++          }
++        }
++        if (sequence_cache && sequence_cache->has_compacted_history() && !NativeLlamaPrefillScope::current()) {
++          throw std::runtime_error("compressed KV history requires explicit native Llama execution");
++        }
++        if (feature_scope && (!NativeLlamaPrefillScope::current() ||
++                              feature_scope->cache() != h->state.cache || !sequence_cache)) {
++          throw std::runtime_error("resident features: scope requires matching native prefill/cache");
++        }
++        if (attention_label_scope && (!NativeLlamaPrefillScope::current() ||
++            attention_label_scope->cache() != h->state.cache || !sequence_cache ||
++            feature_scope || prefill || !sequence_cache->has_full_history_storage() ||
++            sequence_cache->has_attention_selection() || sequence_cache->attention_selection_layer_calls() != 0)) {
++          throw std::runtime_error("resident attention labels: matching never-sparse dense native T1 owner required");
++        }
++        if (prefill && (prefill->submitted() || prefill->cache() != h->state.cache ||
++                       !sequence_cache || !program.mutable_buffer_map.empty() ||
++                       h->stream.device.type != ::mlx::core::Device::gpu ||
++                       program.input_map.size() != 2 || program.output_map.size() != 1 ||
++                       program.output_map.front().slot_type != SlotType::TensorSlot)) {
++          throw std::runtime_error("resident prefill: incompatible delegate/cache");
++        }
++        if (prefill && prefill->allow_partial_native()) {
++          const auto* native = NativeLlamaPrefillScope::current();
++          if (!native || !is_native_moe_policy_architecture(native->config().architecture) ||
++              native->cache() != h->state.cache || feature_scope || attention_label_scope ||
++              !sequence_cache || !sequence_cache->has_full_history_storage() ||
++              sequence_cache->has_attention_selection() || sequence_cache->attention_selection_layer_calls()) {
++            throw std::runtime_error("resident partial prefill: admitted full-history Granite required");
++          }
++        }
++        if (greedy_scope) {
++          const auto* native = NativeLlamaPrefillScope::current();
++          if (!native || native->cache() != greedy_scope->cache_ ||
++              greedy_scope->cache_ != h->state.cache || !sequence_cache ||
++              h->stream.device.type != ::mlx::core::Device::gpu ||
++              prefill || feature_scope || attention_label_scope || native->active_tokens() != 0 ||
++              !sequence_cache->has_complete_history_positions() || sequence_cache->has_attention_selection() ||
++              sequence_cache->attention_selection_layer_calls() != 0 ||
++              !program.mutable_buffer_map.empty() || program.input_map.size() != 2 ||
++              program.input_map.front().slot_type != SlotType::TensorSlot ||
++              program.output_map.size() != 1 || program.output_map.front().slot_type != SlotType::TensorSlot ||
++              !h->state.host_positions || h->state.host_positions->size() != 1 ||
++              native->config().vocabulary != greedy_scope->vocabulary_) {
++            throw std::runtime_error("resident greedy: matching full-history native GPU T1 required");
++          }
++          const auto& tokens = h->state.const_tensor_ref(Tid{program.input_map.front().idx});
++          if (tokens.shape() != ::mlx::core::Shape{1, 1} || tokens.dtype() != ::mlx::core::int64) {
++            throw std::runtime_error("resident greedy: token input is not static int64 T1");
++          }
++          // Admission above excludes cache-only execution, sparse/hot caches,
++          // observers and mutable side state. Each admitted MoE full-history T1 reads
++          // each newly slice-updated Pool root into attention and then logits.
++          // Granite and OLMoE both consume every layer's updated K/V in attention. Other adapters require their own audit.
++          greedy_kv_dependencies_covered =
++              is_native_moe_policy_architecture(native->config().architecture);
++          trace_granite_greedy = trace_prefill && greedy_kv_dependencies_covered;
++        }
++        if (auto* native = NativeLlamaPrefillScope::current()) {
++          const bool neox = native->config().architecture == NativeModelArchitecture::GPTNeoXParallel;
++          const bool granite = is_native_moe_policy_architecture(native->config().architecture);
++          if ((neox || granite) && (feature_scope || attention_label_scope || !sequence_cache ||
++              sequence_cache->has_attention_selection() || !sequence_cache->has_complete_history_positions())) {
++            throw std::runtime_error("native architecture requires full-history execution without advisers/labels");
++          }
++          if (native->cache() != h->state.cache || !sequence_cache ||
++              h->stream.device.type != ::mlx::core::Device::gpu ||
++              !program.mutable_buffer_map.empty() || !h->state.host_positions) {
++            throw std::runtime_error("native Llama prefill: incompatible cache/device/positions");
++          }
++          if (native->active_tokens() > 0) {
++            if ((prefill && !(granite && prefill->allow_partial_native())) ||
++                feature_scope || attention_label_scope || !sequence_cache->has_full_history_storage() ||
++                size_t(native->active_tokens()) > h->state.host_positions->size()) {
++              throw std::runtime_error("native Llama partial prefill: final full-history call required without features");
++            }
++            // One final-logit call or explicitly admitted partial cache-only
++            // chunk; never an exported/interpreted fallback.
++            native->mark_active_tokens_dispatched();
++          }
++          if (trace_prefill) {
++            timing_tokens = native->active_tokens() > 0
++                ? size_t(native->active_tokens()) : h->state.host_positions->size();
++            timing_position = timing_tokens ? h->state.host_positions->front() : -1;
++            timing_cache_only = prefill != nullptr;
++          }
++          if ((h->native_prefill && (neox || granite)) ||
++              (h->native_neox && !neox) || (h->native_granite_moe && !granite)) {
++            throw std::runtime_error("native architecture changed for loaded program");
++          }
++          if (granite ? !h->native_granite_moe : neox ? !h->native_neox : !h->native_prefill) {
++            if (trace_prefill) {
++              const auto& info = ::mlx::core::gpu::device_info(0);
++              const auto architecture = std::get<std::string>(info.at("architecture"));
++              std::fprintf(stderr, "TRIFUSE_PREFILL_DEVICE architecture=%s\n", architecture.c_str());
++            }
++            const auto timing_start = trace_prefill
++                ? PrefillTimingClock::now() : PrefillTimingClock::time_point{};
++            if (granite) {
++              h->native_granite_moe = std::make_unique<NativeGraniteMoEPrefill>(
++                  program, h->constants, native->config(), h->stream);
++            } else if (neox) {
++              h->native_neox = std::make_unique<NativeNeoXPrefill>(
++                  program, h->constants, native->config(), h->stream);
++            } else {
++              h->native_prefill = std::make_unique<NativeLlamaPrefill>(
++                  program, h->constants, native->config(), h->stream);
++            }
++            if (trace_prefill) prefill_timing("native_constructor", timing_start,
++                h->stream.index, timing_position, timing_tokens, timing_cache_only);
++          }
++          if (!(granite ? h->native_granite_moe->matches(native->config()) :
++                neox ? h->native_neox->matches(native->config()) : h->native_prefill->matches(native->config()))) {
++            throw std::runtime_error("native Llama prefill: configuration changed for loaded program");
++          }
++          if (feature_scope) {
++            const auto& positions = *h->state.host_positions;
++            feature_scope->config().validate_for(native->config().layers, int(positions.size()));
++            feature_ticket->configure_locked(positions.front(), int(positions.size()), feature_scope->config());
++          }
++          if (attention_label_scope) {
++            const auto& positions = *h->state.host_positions;
++            attention_label_scope->config().validate_for(native->config().layers, int(positions.size()));
++            attention_label_ticket->configure_locked(positions.front(), native->config(), attention_label_scope->config());
++          }
++          if (trace_granite_greedy) {
++            kv_addresses_before = snapshot_kv_addresses_locked(
++                *sequence_cache, size_t(native->config().layers) * 2);
++          }
++          const auto timing_start = trace_prefill
++              ? PrefillTimingClock::now() : PrefillTimingClock::time_point{};
++          const auto run_native = [&](const auto& adapter) { return adapter->run(
++              h->state.const_tensor_ref(Tid{program.input_map[0].idx}),
++              *h->state.host_positions, *sequence_cache, prefill != nullptr,
++              [&](const array& x) { return h->native_prefill_silu.apply(x, h->stream); },
++              h->stream, feature_scope ? &feature_scope->config() : nullptr,
++              feature_ticket ? &feature_ticket->summary_locked() : nullptr,
++              native->active_tokens(),
++              attention_label_scope ? &attention_label_scope->config() : nullptr,
++              attention_label_ticket ? &attention_label_ticket->summary_locked() : nullptr); };
++          const auto logits = granite ? h->native_granite_moe->run(
++              h->state.const_tensor_ref(Tid{program.input_map[0].idx}),
++              *h->state.host_positions, *sequence_cache, prefill != nullptr,
++              [&](const array& x) { return h->native_prefill_silu.apply(x, h->stream); },
++              h->stream, nullptr, nullptr, native->active_tokens(), nullptr, nullptr,
++              greedy_device_input.get(), prefill && prefill->allow_partial_native() && native->active_tokens() > 0) :
++              neox ? run_native(h->native_neox) : run_native(h->native_prefill);
++          if (trace_prefill) prefill_timing("native_run_graph", timing_start,
++              h->stream.index, timing_position, timing_tokens, timing_cache_only);
++          if (logits) {
++            h->state.set_tensor(Tid{program.output_map[0].idx}, *logits);
++          } else if (!prefill) {
++            throw std::runtime_error("native Llama prefill: final logits missing");
++          }
++        } else {
++          h->interpreter.run(program, h->state, h->stream);
++        }
++
++        if (prefill) {
++          const auto timing_start = trace_prefill
++              ? PrefillTimingClock::now() : PrefillTimingClock::time_point{};
++          auto roots = sequence_cache->storage_roots();
++          if (roots.empty()) throw std::runtime_error("resident prefill: no KV roots");
++          if (feature_ticket) {
++            if (!feature_ticket->summary_locked()) throw std::runtime_error("resident features: no summary roots");
++            roots.push_back(*feature_ticket->summary_locked());
++            feature_ticket->begin_submission_locked();
++          }
++          ::mlx::core::async_eval(roots);
++          if (feature_ticket) feature_ticket->seal_locked();
++          if (trace_prefill) prefill_timing("kv_roots_async_submit", timing_start,
++              h->stream.index, timing_position, timing_tokens, timing_cache_only);
++          // Output-only work is intentionally not evaluated. Async MLX work
++          // retains its dependency arrays; the outer owner retains ET inputs.
++          h->state.reset();
++          prefill->mark_submitted();
++          cache_only_submitted = true;
++        }
+ 
++        if (greedy_scope) {
++          const auto& logits = h->state.const_tensor_ref(Tid{program.output_map.front().idx});
++          if (logits.dtype() != ::mlx::core::float32 ||
++              logits.shape() != ::mlx::core::Shape{1, 1, greedy_scope->vocabulary_}) {
++            throw std::runtime_error("resident greedy: native logits ABI differs");
++          }
++          h->greedy_output = std::make_unique<ResidentGreedyStorage>();
++          auto& storage = *h->greedy_output;
++          // Reduce the existing FP32 output, without re-running model math or
++          // materializing its vocabulary row into the ET/ObjC/Swift bridge.
++          storage.roots.push_back(::mlx::core::astype(
++              ::mlx::core::argmax(logits, false, h->stream), ::mlx::core::int64, h->stream));
++          storage.roots.push_back(::mlx::core::all(
++              ::mlx::core::isfinite(logits, h->stream), false, h->stream));
++          if (!greedy_kv_dependencies_covered) {
++            auto kv = sequence_cache->storage_roots();
++            if (kv.empty()) throw std::runtime_error("resident greedy: no KV roots");
++            storage.roots.insert(storage.roots.end(), kv.begin(), kv.end());
++          }
++          const auto submit_start = trace_granite_greedy
++              ? PrefillTimingClock::now() : PrefillTimingClock::time_point{};
++          ::mlx::core::async_eval(storage.roots);
++          if (trace_granite_greedy) prefill_timing("greedy_async_submit", submit_start,
++              h->stream.index, timing_position, timing_tokens, timing_cache_only);
++          storage.completions.reserve(storage.roots.size());
++          for (const auto& root : storage.roots) {
++            if (root.status() == array::Status::unscheduled ||
++                (!root.event().valid() && root.status() != array::Status::available)) {
++              throw std::runtime_error("resident greedy: missing root completion event");
++            }
++            storage.completions.push_back(root.event());
++          }
++        }
++
++        if (greedy_submission) {
++          const auto& logits = h->state.const_tensor_ref(Tid{program.output_map.front().idx});
++          if (logits.dtype() != ::mlx::core::float32 ||
++              logits.shape() != ::mlx::core::Shape{1, 1, greedy_submission->vocabulary_})
++            throw std::runtime_error("greedy submission: native logits ABI differs");
++          auto& ticket = *submitted_prediction->storage_;
++          ticket.cache = sequence_cache;
++          ticket.vocabulary = greedy_submission->vocabulary_;
++          ticket.next_position = greedy_submission->position_ + 1;
++          ticket.stream_index = h->stream.index;
++          ticket.input_lease = greedy_submission->input_lease_;
++          ticket.token = ::mlx::core::reshape(::mlx::core::where(
++              ::mlx::core::all(::mlx::core::isfinite(logits, h->stream), false, h->stream),
++              ::mlx::core::astype(::mlx::core::argmax(logits, false, h->stream), ::mlx::core::int64, h->stream),
++              array(int64_t(-1), ::mlx::core::int64), h->stream), {}, h->stream);
++          if (greedy_submission->initial_prediction_) {
++            auto roots = sequence_cache->storage_roots();
++            if (roots.empty()) throw std::runtime_error("greedy initial prediction: missing KV roots");
++            roots.push_back(*ticket.token);
++            ::mlx::core::async_eval(roots);
++          } else {
++            // Admitted Granite logits include every K/V write as ancestors.
++            ::mlx::core::async_eval({*ticket.token});
++          }
++          if (ticket.token->status() == array::Status::unscheduled ||
++              (!ticket.token->event().valid() && ticket.token->status() != array::Status::available))
++            throw std::runtime_error("greedy submission: no completion event");
++          ticket.completion = ticket.token->event();
++          ticket.sealed = true;
++          greedy_submission->output_ = submitted_prediction;
++          h->state.reset();
++          // Clear cadence and final drains belong to the exclusive pipeline
++          // owner, not the synchronous delegate execute counter.
++          return Error::Ok;
++        }
++
++        if (!prefill && !greedy_scope) {
+         // Prepare output pipeline and collect int outputs
+         // Build contiguous + dtype conversion lazily for each tensor output,
+         // and extract int outputs (which don't need GPU) while still locked.
+@@ -520,19 +1637,90 @@ class MLXBackend final : public ::executorch::runtime::BackendInterface {
+         // async_eval encodes Metal commands and returns immediately.
+         // The GPU will signal events on completion.
+         if (!prepared_outputs.empty()) {
+-          ::mlx::core::async_eval(prepared_outputs);
++          const auto timing_start = trace_prefill
++              ? PrefillTimingClock::now() : PrefillTimingClock::time_point{};
++          if (feature_ticket || attention_label_ticket) {
++            // This temporary (including summary array references) is destroyed
++            // while locked, including when submission throws.
++            auto roots = prepared_outputs;
++            if (feature_ticket) {
++              if (!feature_ticket->summary_locked()) throw std::runtime_error("resident features: no summary roots");
++              roots.push_back(*feature_ticket->summary_locked());
++              feature_ticket->begin_submission_locked();
++            }
++            if (attention_label_ticket) {
++              if (!attention_label_ticket->summary_locked()) throw std::runtime_error("resident attention labels: no summary root");
++              roots.push_back(*attention_label_ticket->summary_locked());
++              attention_label_ticket->begin_submission_locked();
++            }
++            ::mlx::core::async_eval(roots);
++            if (feature_ticket) feature_ticket->seal_locked();
++            if (attention_label_ticket) attention_label_ticket->seal_locked();
++          } else {
++            ::mlx::core::async_eval(prepared_outputs);
++          }
++          if (trace_prefill) prefill_timing("final_outputs_async_submit", timing_start,
++              h->stream.index, timing_position, timing_tokens, timing_cache_only);
++        }
+         }
+ 
+       } // Lock released — GPU is still executing
+ 
++      if (feature_ticket) feature_scope->publish(feature_ticket);
++      if (attention_label_ticket) attention_label_scope->publish(attention_label_ticket);
++      if (cache_only_submitted) return Error::Ok;
++
++      if (greedy_scope) {
++        const auto wait_start = trace_granite_greedy
++            ? PrefillTimingClock::now() : PrefillTimingClock::time_point{};
++        // Event::wait also checks a signaled asynchronous error; array::wait
++        // alone can take the already-available fast path. Do not hold the graph
++        // mutex while waiting for GPU completion.
++        for (auto& event : h->greedy_output->completions) {
++          if (event.valid()) event.wait();
++        }
++        std::lock_guard<std::mutex> lock(mlx_global_mutex());
++        auto& roots = h->greedy_output->roots;
++        for (auto& root : roots) root.wait();
++        if (roots[0].dtype() != ::mlx::core::int64 || roots[0].size() != 1 ||
++            roots[1].dtype() != ::mlx::core::bool_ || roots[1].size() != 1 ||
++            !roots[0].data<int64_t>() || !roots[1].data<bool>() || !*roots[1].data<bool>()) {
++          throw std::runtime_error("resident greedy: nonfinite logits or invalid scalar output");
++        }
++        const int64_t token = *roots[0].data<int64_t>();
++        if (token < 0 || token >= greedy_scope->vocabulary_) {
++          throw std::runtime_error("resident greedy: selected token outside vocabulary");
++        }
++        greedy_result = ResidentGreedyResult{token, greedy_scope->vocabulary_};
++        // The scope is not marked completed until all remaining successful-
++        // path maintenance below has also returned.
++        h->greedy_output.reset();
++        if (trace_granite_greedy) {
++          prefill_timing("greedy_wait_scalar", wait_start,
++              h->stream.index, timing_position, timing_tokens, timing_cache_only);
++          const auto after = snapshot_kv_addresses_locked(
++              *static_cast<MLXSequenceCache*>(h->state.cache), kv_addresses_before.addresses.size());
++          trace_kv_address_reuse(kv_addresses_before, after,
++              h->stream.index, timing_position, timing_tokens);
++        }
++      }
++
++      const auto timing_start = trace_prefill
++          ? PrefillTimingClock::now() : PrefillTimingClock::time_point{};
+       for (auto& info : tensor_output_info) {
+         ETTensor& out_tensor = args[info.arg_idx]->toTensor();
+ 
+         // write_output waits on arr to be ready
+         write_output(prepared_outputs[info.prepared_idx], out_tensor);
+       }
++      if (trace_prefill) prefill_timing("final_outputs_wait_copy", timing_start,
++          h->stream.index, timing_position, timing_tokens, timing_cache_only);
+ 
+-      h->state.reset(); // Release temp GPU buffers back to MLX cache
++      {
++        std::lock_guard<std::mutex> lock(mlx_global_mutex());
++        h->state.reset(); // Release temporary arrays under the graph mutex.
++        prepared_outputs.clear();
++      }
+ 
+       // Periodically release MLX's cached buffer pool. The counter increment
+       // and clear_cache() run under the global mutex so they can't race another
+@@ -544,12 +1732,27 @@ class MLXBackend final : public ::executorch::runtime::BackendInterface {
+         }
+       }
+ 
++      if (greedy_scope) {
++        if (!greedy_result) throw std::runtime_error("resident greedy: missing completed result");
++        // Publish the dependency-completion receipt only after scalar event
++        // waits, finite/range checks and normal maintenance all succeeded.
++        greedy_result->kv_dependencies_completed = greedy_kv_dependencies_covered;
++        greedy_scope->finish(*greedy_result);
++      }
+       return Error::Ok;
+     } catch (const std::exception& e) {
++      if (auto* greedy = ResidentGreedyOutputScope::current()) greedy->fail();
+       ET_LOG(Error, "MLX execute failed: %s", e.what());
++      // Mobile release builds can disable ET logging. Preserve the cause of
++      // a failed submission/completion without adding successful-path tracing.
++      std::fprintf(stderr, "TRIFUSE_MLX_EXECUTE_ERROR: %s\n", e.what());
++      std::fflush(stderr);
+       return Error::Internal;
+     } catch (...) {
++      if (auto* greedy = ResidentGreedyOutputScope::current()) greedy->fail();
+       ET_LOG(Error, "MLX execute failed: unknown non-std exception");
++      std::fprintf(stderr, "TRIFUSE_MLX_EXECUTE_ERROR: unknown non-std exception\n");
++      std::fflush(stderr);
+       return Error::Internal;
+     }
+   }
+diff --git a/backends/mlx/runtime/MLXCellCache.h b/backends/mlx/runtime/MLXCellCache.h
+index 566fc6f..f7ca305 100644
+--- a/backends/mlx/runtime/MLXCellCache.h
++++ b/backends/mlx/runtime/MLXCellCache.h
+@@ -101,6 +101,9 @@ class MLXCellCache : public cache::CellCache, public MLXCache {
+     if (!cache::valid(cfg)) {
+       throw std::runtime_error("MLXCellCache: invalid CacheConfig");
+     }
++    if (cfg.allocation_capacity) {
++      throw std::runtime_error("MLXCellCache: explicit allocation ceiling requires full-history sequence storage");
++    }
+     return cfg;
+   }
+ 
+diff --git a/backends/mlx/runtime/MLXExecutor.h b/backends/mlx/runtime/MLXExecutor.h
+index eea49e4..94edded 100644
+--- a/backends/mlx/runtime/MLXExecutor.h
++++ b/backends/mlx/runtime/MLXExecutor.h
+@@ -9,6 +9,8 @@
+ #pragma once
+ 
+ #include "MLXLoader.h"
++#include "MLXConstantAliasDiagnostics.h"
++#include "MLXConstantPool.h"
+ 
+ #include <mlx/array.h>
+ #include <mlx/fast.h>
+@@ -163,6 +165,10 @@ struct ExecutionState {
+   // Non-constant values (SymInt, etc.)
+   std::vector<std::optional<Value>> values;
+ 
++  // Set only after static input-position provenance and live input ABI checks.
++  // Owned per invocation; reset prevents stale positions after crop or reuse.
++  std::optional<std::vector<int32_t>> host_positions;
++
+   // Init chain flag: when true, set_tensor allows writing to constants
+   bool is_init_chain{false};
+ 
+@@ -254,6 +260,7 @@ struct ExecutionState {
+   }
+ 
+   void reset() {
++    host_positions.reset();
+     // Clear per-execution tensors (inputs, outputs, temps)
+     // Constants and mutable buffers are not in this vector
+     for (auto& t : tensors) {
+@@ -733,13 +740,25 @@ inline void load_constants(
+     const MLXProgram& program,
+     const runtime::NamedDataMap* named_data_map,
+     ConstantData& store,
+-    std::vector<runtime::FreeableBuffer>& constant_buffers) {
++    std::vector<runtime::FreeableBuffer>& constant_buffers,
++    ::mlx::core::Device device = ::mlx::core::Device::gpu) {
+   using namespace ::mlx::core;
+ 
+   store.tensors.clear();
+   constant_buffers.clear();
+ 
++  // An inactive scope leaves the original per-handle path intact. The pool
++  // owns immutable source leases; each canonical array also owns its lease.
++  auto constant_pool = current_mlx_constant_pool();
++  std::optional<MLXConstantPool::Load> pool_load;
++  if (constant_pool) pool_load.emplace(constant_pool->begin_load(
++      device.type == Device::gpu, kEnableConstantZeroCopy, program.init_chain_idx < 0));
++  std::optional<MLXConstantAliasDiagnostics> alias_diagnostics;
++  if (mlx_constant_alias_diagnostics_enabled()) alias_diagnostics.emplace(kEnableConstantZeroCopy);
++
+   if (program.num_constant_tensors == 0) {
++    if (alias_diagnostics) alias_diagnostics->mark_load_completed();
++    if (pool_load) pool_load->mark_completed();
+     return;
+   }
+ 
+@@ -786,38 +805,46 @@ inline void load_constants(
+           "': error " + std::to_string(static_cast<int>(data_result.error())));
+     }
+ 
+-    // Move the buffer into our storage (keeps it alive for zero-copy)
+-    constant_buffers.push_back(std::move(data_result.get()));
+-    runtime::FreeableBuffer& buffer = constant_buffers.back();
+-
+     const auto& meta = *program.tensor_meta[tid];
+     Shape shape = to_shape(meta.shape);
+     Dtype dtype = resolve_dtype(meta.scalar_type);
+-
+-    // Create MLX array with zero-copy when enabled.
+-    // SAFETY: Constants are read-only; the program builder ensures no in-place
+-    // ops target constant tensors. The const_cast is required by MLX's array
+-    // constructor but the data will not be mutated
+-    void* data_ptr = const_cast<void*>(buffer.data());
+-
+-    if constexpr (kEnableConstantZeroCopy) {
+-      // Zero-copy: wrap pointer directly with no-op deleter
+-      // The FreeableBuffer in constant_buffers keeps the data alive
+-      auto deleter = [](void*) {
+-        // Data lifetime managed by FreeableBuffer in
+-        // MLXHandle::constant_buffers
+-      };
+-      array arr = array(data_ptr, shape, dtype, deleter);
+-      store.add(std::move(arr));
+-    } else {
+-      // No deleter = MLX copies the data into its own memory
+-      store.add(array(static_cast<const char*>(data_ptr), shape, dtype));
++    void* data_ptr = const_cast<void*>(data_result.get().data());
++    bool pooled = false;
++    if (pool_load && pool_load->eligible()) {
++      const auto key = make_mlx_constant_pool_key(*name, data_result.get(), shape, dtype, device);
++      if (key.source && key.logical_bytes && key.logical_bytes <= key.source_bytes) {
++        store.add(load_mlx_pooled_constant(*pool_load, key, std::move(data_result.get()), shape, dtype));
++        pooled = true;
++      }
++    }
++    if (!pooled) {
++      // Legacy ownership/layout is unchanged outside an eligible pool load.
++      // Private source leases outlive all handle-local arrays/views.
++      constant_buffers.push_back(std::move(data_result.get()));
++      if constexpr (kEnableConstantZeroCopy) {
++        // Constants are read-only; the builder forbids in-place constant ops.
++        // Legacy source lifetime is managed by MLXHandle::constant_buffers.
++        array arr = array(data_ptr, shape, dtype, [](void*) {});
++        store.add(std::move(arr));
++      } else {
++        store.add(array(static_cast<const char*>(data_ptr), shape, dtype));
++      }
++      if (pool_load) pool_load->fallback(store.tensors.back().nbytes(),
++          pool_load->eligible() ? MLXConstantPoolFallback::Storage : pool_load->fallback_reason());
++    }
++    if (alias_diagnostics) {
++      // Both objects still own their storage. Observe immediately without an
++      // extra eval or barrier; unavailable arrays are reported as unknown.
++      alias_diagnostics->observe_array(*name, data_ptr, store.tensors.back());
+     }
+   }
+ 
+   // Evaluate all constants immediately to prepare Metal buffers
+   // This trades init time for faster first inference
+   eval(store.tensors);
++  if (alias_diagnostics) alias_diagnostics->mark_load_completed();
++  if (pool_load) pool_load->mark_completed();
++
+ }
+ 
+ inline void load_mutable_buffers(
+diff --git a/backends/mlx/runtime/MLXInterpreter.h b/backends/mlx/runtime/MLXInterpreter.h
+index 001c3fd..ad069b5 100644
+--- a/backends/mlx/runtime/MLXInterpreter.h
++++ b/backends/mlx/runtime/MLXInterpreter.h
+@@ -12,12 +12,16 @@
+ #include "MLXExecutor.h"
+ 
+ #include <algorithm>
++#include <functional>
++#include <map>
+ #include <vector>
+ 
+ #include <mlx/array.h>
++#include <mlx/compile.h>
+ #include <mlx/fast.h>
+ #include <mlx/mlx.h>
+ #include <mlx/ops.h>
++#include <mlx/version.h>
+ 
+ namespace executorch {
+ namespace backends {
+@@ -321,43 +325,45 @@ inline void exec_update_and_attend(
+   // The cache does the KV write + read and declares the mask; the handler owns
+   // the query side (q, scale) and calls SDPA.
+   const array& q = st.const_tensor_ref(n.q);
+-  // One position per query token, read host-side so the cache stays pure graph
+-  // + integer bookkeeping. Every layer of a step reads the same position
+-  // tensor, so evaluating it in place costs one sync for the first layer and
+-  // nothing for the rest.
++  // Proven input views use the exact checked host input, avoiding a stream
++  // event wait that would otherwise drain an earlier async prefill block.
++  // Unknown position graphs retain the original evaluation path.
+   auto pos = st.const_tensor_ref(n.position);
+-  eval(pos);
+-  // The entries are read in order off the buffer, which a strided view would
+-  // walk with the wrong stride.
+-  if (!pos.flags().row_contiguous) {
+-    throw std::runtime_error("update_and_attend: position must be contiguous");
+-  }
+-  const int length = static_cast<int>(pos.size());
+-  if (length != static_cast<int>(q.shape(2))) {
++  if (pos.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
++      static_cast<int>(pos.size()) != q.shape(2)) {
+     throw std::runtime_error(
+         "update_and_attend: position must hold one entry per query token");
+   }
+-  std::vector<int32_t> positions(static_cast<size_t>(length));
+-  switch (pos.dtype()) {
+-    case ::mlx::core::int32:
+-      std::copy(
+-          pos.data<int32_t>(), pos.data<int32_t>() + length, positions.begin());
+-      break;
+-    case ::mlx::core::int64:
+-      std::transform(
+-          pos.data<int64_t>(),
+-          pos.data<int64_t>() + length,
+-          positions.begin(),
+-          [](int64_t p) { return static_cast<int32_t>(p); });
+-      break;
+-    default:
+-      throw std::runtime_error(
+-          std::string("update_and_attend: position must be int32 or int64, ") +
+-          "got " + ExecutionState::dtype_str(pos.dtype()));
++  const size_t length = pos.size();
++  std::vector<int32_t> evaluated_positions;
++  const std::vector<int32_t>* positions = nullptr;
++  if (st.host_positions) {
++    if (st.host_positions->size() != length ||
++        (pos.dtype() != ::mlx::core::int32 && pos.dtype() != ::mlx::core::int64)) {
++      throw std::runtime_error("update_and_attend: proven host position ABI differs");
++    }
++    positions = &*st.host_positions;
++  } else {
++    eval(pos);
++    if (!pos.flags().row_contiguous) {
++      throw std::runtime_error("update_and_attend: position must be contiguous");
++    }
++    evaluated_positions.reserve(length);
++    for (size_t i = 0; i < length; ++i) {
++      int64_t value;
++      if (pos.dtype() == ::mlx::core::int32) value = pos.data<int32_t>()[i];
++      else if (pos.dtype() == ::mlx::core::int64) value = pos.data<int64_t>()[i];
++      else throw std::runtime_error("update_and_attend: position must be int32 or int64");
++      if (value < 0 || value > std::numeric_limits<int32_t>::max()) {
++        throw std::runtime_error("update_and_attend: position outside nonnegative int32 range");
++      }
++      evaluated_positions.push_back(static_cast<int32_t>(value));
++    }
++    positions = &evaluated_positions;
+   }
+   AttendSpec spec = st.cache->update_and_fetch(
+       *n.layer_id,
+-      positions,
++      *positions,
+       st.const_tensor_ref(n.k),
+       st.const_tensor_ref(n.v),
+       s);
+@@ -640,9 +646,59 @@ exec_arange(const ARangeNode& n, ExecutionState& st, StreamOrDevice s) {
+   }
+ }
+ 
+-inline void exec_silu(const SiluNode& n, ExecutionState& st, StreamOrDevice s) {
+-  const auto& x = st.const_tensor_ref(n.x);
+-  st.set_tensor(n.out, multiply(x, sigmoid(x, s), s));
++// Owned by one Interpreter, whose caller serializes graph construction. MLX's
++// compiler additionally keys its trace cache by rank, dtype and default stream;
++// shapeless compilation reuses a trace for T128/T1 without fixing tensor sizes.
++class CompiledSilu {
++ public:
++  array apply(const array& x, StreamOrDevice s) const {
++    const Stream stream = to_stream(s);
++    // The compiler consults the default device/stream even when primitives
++    // receive an explicit stream. Bind both for construction AND invocation,
++    // and restore the caller's thread-local defaults on normal/error return.
++    CompilationStreamContext context(stream);
++    auto it = functions_.find(stream);
++    if (it == functions_.end()) {
++      it = functions_.emplace(stream, compile(&trace, /*shapeless=*/true)).first;
++    }
++    return it->second({x}).at(0);
++  }
++
++ private:
++  struct CompilationStreamContext {
++    explicit CompilationStreamContext(Stream stream)
++        : previous_selected(default_stream(stream.device)), context(stream) {}
++    ~CompilationStreamContext() {
++      // StreamContext restores the prior active device/stream, but switching
++      // devices also changed that other device's default stream. Restore it.
++      set_default_stream(previous_selected);
++    }
++    Stream previous_selected;
++    StreamContext context;
++  };
++
++  using Function =
++      std::function<std::vector<array>(const std::vector<array>&)>;
++  mutable std::map<Stream, Function> functions_;
++
++  // A permanent function address avoids a captured closure/function-id lifetime
++  // across host-thread migration. All stream selection is scoped in apply();
++  // no input, model state or reference to a caller's StreamOrDevice is retained.
++  // Keep MLX's dtype-local sigmoid and multiply, as official compiled SiLU does:
++  // no hidden FP32 promotion or alternate activation formula. Fusion may change
++  // device rounding, so this is not a bitwise/numerical qualification claim.
++  static std::vector<array> trace(const std::vector<array>& inputs) {
++    const auto& x = inputs.at(0);
++    return {multiply(x, sigmoid(x))};
++  }
++};
++
++inline void exec_silu(
++    const SiluNode& n,
++    ExecutionState& st,
++    StreamOrDevice s,
++    const CompiledSilu& compiled_silu) {
++  st.set_tensor(n.out, compiled_silu.apply(st.const_tensor_ref(n.x), s));
+ }
+ 
+ inline void
+@@ -1023,6 +1079,9 @@ exec_gather_qmm(const GatherQmmNode& n, ExecutionState& st, StreamOrDevice s) {
+       n.group_size,
+       n.bits,
+       n.mode,
++#if MLX_VERSION_NUMERIC >= 32003
++      std::nullopt, // The exported Q/S/B ABI has no optional global scale.
++#endif
+       sorted,
+       s);
+   st.set_tensor(n.out, std::move(Y));
+@@ -1990,6 +2049,9 @@ class Interpreter {
+   }
+ 
+  private:
++  // Persistent across ExecutionState::reset(), separate for each delegate.
++  ops::CompiledSilu compiled_silu_;
++
+   void exec_if(
+       const MLXProgram& prog,
+       const IfNode& n,
+@@ -2132,7 +2194,7 @@ class Interpreter {
+         ops::exec_arange(std::get<ARangeNode>(instr.node), st, s);
+         break;
+       case OpCode::SILU:
+-        ops::exec_silu(std::get<SiluNode>(instr.node), st, s);
++        ops::exec_silu(std::get<SiluNode>(instr.node), st, s, compiled_silu_);
+         break;
+       case OpCode::SIGMOID:
+         ops::exec_sigmoid(std::get<SigmoidNode>(instr.node), st, s);
+diff --git a/backends/mlx/runtime/MLXPool.h b/backends/mlx/runtime/MLXPool.h
+index b60f796..caa956b 100644
+--- a/backends/mlx/runtime/MLXPool.h
++++ b/backends/mlx/runtime/MLXPool.h
+@@ -9,6 +9,10 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <limits>
++#include <numeric>
+ #include <optional>
+ #include <stdexcept>
+ #include <vector>
+@@ -26,6 +30,36 @@ namespace mlx {
+ // where in them a step lands.
+ class Pool {
+  public:
++  // Built once by the owner and shared by K/V and layers. Metal scatter itself
++  // does not check indices; validate distinct, nonnegative (head, cell) pairs.
++  class HeadCells {
++   public:
++    HeadCells(const std::vector<int32_t>& heads, const std::vector<int32_t>& cells)
++        : heads_(heads.data(), {int(heads.size())}, ::mlx::core::int32),
++          cells_(cells.data(), {int(cells.size())}, ::mlx::core::int32),
++          count_(int(cells.size())) {
++      if (heads.empty() || heads.size() != cells.size() ||
++          heads.size() > size_t(std::numeric_limits<int>::max()))
++        throw std::invalid_argument("Pool::HeadCells: invalid row count");
++      std::vector<uint64_t> pairs;
++      pairs.reserve(heads.size());
++      for (size_t i = 0; i < heads.size(); ++i) {
++        if (heads[i] < 0 || cells[i] < 0)
++          throw std::invalid_argument("Pool::HeadCells: negative index");
++        max_head_ = std::max(max_head_, heads[i]);
++        max_cell_ = std::max(max_cell_, cells[i]);
++        pairs.push_back((uint64_t(heads[i]) << 32) | uint32_t(cells[i]));
++      }
++      std::sort(pairs.begin(), pairs.end());
++      if (std::adjacent_find(pairs.begin(), pairs.end()) != pairs.end())
++        throw std::invalid_argument("Pool::HeadCells: duplicate destination");
++    }
++   private:
++    friend class Pool;
++    Tensor heads_, cells_;
++    int count_, max_head_ = 0, max_cell_ = 0;
++  };
++
+   // Holds its geometry but allocates nothing: every array belongs to the
+   // stream its work runs on, and the first stream reaches the pool with the
+   // first write. initial_slots above max_slots is clamped, not rejected: the
+@@ -39,7 +73,7 @@ class Pool {
+ 
+   // Place `update` at slot `start`, casting to the storage dtype if it differs.
+   void write(int start, int len, const Tensor& update, StreamOrDevice s) {
+-    if (start < 0 || start + len > max_slots_) {
++    if (start < 0 || len < 0 || start > max_slots_ || len > max_slots_ - start) {
+       throw std::runtime_error("Pool::write: run out of bounds");
+     }
+     if (static_cast<int>(update.shape(2)) != len) {
+@@ -68,6 +102,9 @@ class Pool {
+       const std::vector<int32_t>& cells,
+       const Tensor& update,
+       StreamOrDevice s) {
++    if (cells.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
++      throw std::runtime_error("Pool::write_cells: cell count overflow");
++    }
+     const int T = static_cast<int>(cells.size());
+     if (static_cast<int>(update.shape(2)) != T) {
+       throw std::runtime_error(
+@@ -99,10 +136,20 @@ class Pool {
+         s);
+   }
+ 
++  // Patch the complete same-shape root. Donation can avoid a full-buffer copy
++  // only when MLX owns it uniquely; external views/lazy dependencies may force COW.
++  void write_head_cells(const HeadCells& indices, const Tensor& updates, StreamOrDevice s) {
++    if (!buf_ || indices.max_head_ >= H_ || indices.max_cell_ >= slots() ||
++        updates.shape() != ::mlx::core::Shape{indices.count_, 1, 1, 1, D_})
++      throw std::invalid_argument("Pool::write_head_cells: incompatible indices or update geometry");
++    const Tensor values = updates.dtype() == dtype_ ? updates : ::mlx::core::astype(updates, dtype_, s);
++    buf_ = ::mlx::core::scatter(*buf_, {indices.heads_, indices.cells_}, values, {1, 2}, s);
++  }
++
+   // Slots [start, start+len). A ring read starts mid-pool, so the start matters
+   // here as much as it does for a write.
+   Tensor read(int start, int len, StreamOrDevice s) const {
+-    if (!buf_ || start < 0 || start + len > slots()) {
++    if (!buf_ || start < 0 || len < 0 || start > slots() || len > slots() - start) {
+       throw std::runtime_error("Pool::read: run out of bounds");
+     }
+     return ::mlx::core::slice(
+@@ -119,12 +166,156 @@ class Pool {
+     return buf_ ? static_cast<int>(buf_->shape(2)) : 0;
+   }
+ 
++  int max_slots() const { return max_slots_; }
++
++  // The source must have completed before rebinding. A fitting buffer is
++  // shared unchanged; an oversized buffer needs a real copy, not a slice
++  // or mlx::copy (which can retain the original backing allocation).
++  Pool prefix_allocation(int keep, int new_max_slots, StreamOrDevice s) const {
++    if (new_max_slots <= 0 || keep < 0 || keep > new_max_slots ||
++        keep > slots() || H_ <= 0 || D_ <= 0) {
++      throw std::invalid_argument("Pool::prefix_allocation: invalid prefix geometry");
++    }
++    if (keep == 0) {
++      return Pool(initial_slots_, new_max_slots, H_, D_, dtype_);
++    }
++    if (slots() <= new_max_slots) {
++      Pool replacement = *this;
++      replacement.max_slots_ = new_max_slots;
++      replacement.initial_slots_ = std::min(initial_slots_, new_max_slots);
++      return replacement;
++    }
++    const int allocated = std::max(keep, slots() - (max_slots_ - new_max_slots));
++    Pool replacement(allocated, new_max_slots, H_, D_, dtype_);
++    // Copy the new physical span directly. Slots after keep are invisible
++    // until overwritten, so their old contents need no zero-fill or gather.
++    if (H_ > 1) {
++      // allocated < slots: the source head stride is larger than its new
++      // row-major span. This view is necessarily non-row-contiguous, so
++      // contiguous(false) creates a new buffer (also when D or allocated=1).
++      replacement.buf_ = ::mlx::core::contiguous(read(0, allocated, s), false, s);
++    } else {
++      // H==1 may already be contiguous. Keep two concatenate inputs, even
++      // with an empty second view, to guarantee an independent allocation.
++      replacement.buf_ = ::mlx::core::concatenate(
++          {read(0, keep, s), read(keep, allocated - keep, s)}, 2, s);
++    }
++    return replacement;
++  }
++
++  // Gather into a new dense allocation. Source arrays remain immutable and
++  // owned until the caller has evaluated every layer and atomically publishes
++  // the replacement pools. This is a physical copy, not a slice retaining the
++  // old full-capacity backing buffer.
++  Pool compact_copy(const std::vector<int32_t>& physical_indices,
++                    int new_max_slots, StreamOrDevice s) const {
++    if (!buf_ || physical_indices.empty() || new_max_slots <= 0 ||
++        new_max_slots > max_slots_ || H_ <= 0 || slots() <= 0 ||
++        H_ > std::numeric_limits<int>::max() / slots() ||
++        physical_indices.size() > static_cast<size_t>(new_max_slots)) {
++      throw std::runtime_error("Pool::compact_copy: invalid retained geometry");
++    }
++    int previous = -1;
++    for (int index : physical_indices) {
++      if (index <= previous || index >= slots())
++        throw std::runtime_error("Pool::compact_copy: unordered or unavailable slot");
++      previous = index;
++    }
++    const int count = static_cast<int>(physical_indices.size());
++    const int allocated = std::max(count, slots() - (max_slots_ - new_max_slots));
++    std::vector<int32_t> rows(static_cast<size_t>(H_) * allocated);
++    for (int head = 0; head < H_; ++head) {
++      const int source_base = head * slots();
++      for (int slot = 0; slot < allocated; ++slot) {
++        // Spare slots stay outside the live view and are overwritten on append.
++        rows[static_cast<size_t>(head) * allocated + slot] = source_base +
++            physical_indices[slot < count ? slot : 0];
++      }
++    }
++    Pool replacement(allocated, new_max_slots, H_, D_, dtype_);
++    // Leading-axis gather writes head-major rows directly, without the large
++    // transpose/contiguous copy caused by take on the sequence axis.
++    replacement.buf_ = ::mlx::core::reshape(::mlx::core::take(
++        ::mlx::core::reshape(*buf_, {H_ * slots(), D_}, s),
++        ::mlx::core::array(rows.data(), {H_ * allocated}, ::mlx::core::int32), 0, s),
++        {1, H_, allocated, D_}, s);
++    return replacement;
++  }
++
++  // SequenceCache evaluates all allocated pools together before publishing a
++  // migration or a completed resident step. This does not enqueue new work.
++  void append_storage(std::vector<Tensor>& arrays) const {
++    if (buf_) {
++      arrays.push_back(*buf_);
++    }
++  }
++
++  // Release the bytes as well as their lazy graph. A later write starts from
++  // zeros, even when the previous cache held nonzero future slots.
++  void reset() noexcept {
++    buf_.reset();
++  }
++
++  // Restore caller-validated allocation bounds without allocating storage.
++  // A compacted replacement pool has smaller bounds; clearing its bytes alone
++  // must not make those bounds the limits of the next dense sequence.
++  void reset_limits(int initial_slots, int max_slots) noexcept {
++    buf_.reset();
++    max_slots_ = max_slots;
++    initial_slots_ = std::min(initial_slots, max_slots);
++  }
++
++  // Full [1,H,max_slots,D] FP32 host storage, including future slots. Growth
++  // leaves the unallocated tail implicit; export materializes that tail as zero.
++  std::vector<float> export_flat_fp32(StreamOrDevice s = {}) const {
++    if (dtype_ != ::mlx::core::float32 || H_ <= 0 || D_ <= 0 || max_slots_ <= 0) {
++      throw std::runtime_error("Pool::export_flat_fp32: invalid FP32 geometry");
++    }
++    size_t count = static_cast<size_t>(H_);
++    for (const int dim : {max_slots_, D_}) {
++      if (count > std::numeric_limits<size_t>::max() / static_cast<size_t>(dim)) {
++        throw std::overflow_error("Pool::export_flat_fp32: element count overflow");
++      }
++      count *= static_cast<size_t>(dim);
++    }
++    if (count > std::numeric_limits<size_t>::max() / sizeof(float)) {
++      throw std::overflow_error("Pool::export_flat_fp32: byte count overflow");
++    }
++    std::vector<float> result(count, 0.0f);
++    if (!buf_) {
++      return result;
++    }
++    const int allocated = slots();
++    if (allocated == 0) {
++      return result;
++    }
++    Tensor dense = ::mlx::core::contiguous(read(0, allocated, s), false, s);
++    dense.eval(); // Blocks until the source bytes can be read on the host.
++    const float* data = dense.data<float>();
++    const size_t source_row = static_cast<size_t>(allocated) * static_cast<size_t>(D_);
++    const size_t target_row = static_cast<size_t>(max_slots_) * static_cast<size_t>(D_);
++    for (size_t i = 0; i < dense.size(); ++i) {
++      if (!std::isfinite(data[i])) {
++        throw std::runtime_error("Pool::export_flat_fp32: nonfinite cache bytes");
++      }
++    }
++    for (int head = 0; head < H_; ++head) {
++      std::memcpy(result.data() + static_cast<size_t>(head) * target_row,
++                  data + static_cast<size_t>(head) * source_row,
++                  source_row * sizeof(float));
++    }
++    return result;
++  }
++
+  private:
+   // Make room for `needed` slots, allocating on first use and thereafter
+   // growing only if the pool is short: double until it fits, never past
+   // max_slots_. Cells keep their index, so growth is a zero-pad on the cell
+   // axis. Every array here is placed on `s`, the stream the step runs on.
+   void maybe_grow(int needed, StreamOrDevice s) {
++    if (needed < 0 || needed > max_slots_) {
++      throw std::runtime_error("Pool::maybe_grow: allocation ceiling exceeded");
++    }
+     if (!buf_) {
+       buf_ = ::mlx::core::zeros(
+           ::mlx::core::Shape{1, H_, initial_slots_, D_}, dtype_, s);
+@@ -135,7 +326,9 @@ class Pool {
+     }
+     int next = std::max(cur, 1); // an empty pool has nothing to double
+     while (next < needed) {
+-      next *= 2;
++      // Saturate before multiplying: a large logical/physical ceiling must
++      // not overflow int during the last geometric growth step.
++      next = next > max_slots_ / 2 ? max_slots_ : next * 2;
+     }
+     // The last doubling can overshoot; write() already bounds `needed` by
+     // max_slots_, so clamping here cannot undershoot it.
+diff --git a/backends/mlx/runtime/MLXSequenceCache.h b/backends/mlx/runtime/MLXSequenceCache.h
+index 79beeeb..5d7ff6c 100644
+--- a/backends/mlx/runtime/MLXSequenceCache.h
++++ b/backends/mlx/runtime/MLXSequenceCache.h
+@@ -8,9 +8,18 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <optional>
++#include <type_traits>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <memory>
+ #include <stdexcept>
+ #include <string>
++#include <unordered_set>
++#include <utility>
+ #include <vector>
+ 
+ #include "MLXCache.h" // AttendSpec, MLXCache
+@@ -19,6 +28,8 @@
+ 
+ #include <executorch/extension/llm/cache/cache.h>
+ #include <executorch/extension/llm/cache/sequence_cache.h>
++#include <executorch/extension/llm/cache/retained_sequence_layout.h>
++#include <executorch/extension/llm/cache/attention_selection.h>
+ 
+ namespace executorch {
+ namespace backends {
+@@ -26,6 +37,71 @@ namespace mlx {
+ 
+ namespace cache = ::executorch::extension::llm::cache;
+ 
++// Complete explicit ABI: [layers,1,heads,capacity,head_dim], row-major FP32.
++// valid_length is logical; every future-slot byte is still part of the state.
++struct FlatFP32State {
++  int layers = 0;
++  int heads = 0;
++  int capacity = 0;
++  int head_dim = 0;
++  int valid_length = 0;
++  std::vector<float> keys;
++  std::vector<float> values;
++};
++
++struct RetainedStorageStats {
++  int absolute_length = 0;
++  int retained_tokens = 0;
++  size_t payload_bytes = 0;
++  size_t buffer_bytes = 0;
++  int logical_capacity = 0;
++  // Configured full-history ceiling. A ring or retained pool may have a
++  // different current ceiling, reported explicitly per layer below.
++  int allocation_capacity = 0;
++  std::vector<int> allocated_slots_per_layer;
++  std::vector<int> max_slots_per_layer;
++  std::vector<int> cold_prefix_tokens_per_layer;
++  // Owned representation bytes, not process RSS or allocator cached memory.
++  size_t cold_payload_bytes = 0;
++  size_t hot_payload_bytes = 0;
++  size_t original_fp16_owner_bytes = 0;
++};
++
++// Immutable MLX affine prefix. 8-bit values are packed in uint32 words;
++// FP16 scale and bias are stored per group of 64 original channels. No rotation.
++struct ColdLayer {
++  Tensor key_codes;
++  Tensor key_scales;
++  Tensor key_biases;
++  Tensor value_codes;
++  Tensor value_scales;
++  Tensor value_biases;
++  int tokens = 0;
++};
++
++struct AttentionSelectionStats {
++  bool reuse_enabled = false;
++  bool delta_reuse_enabled = false;
++  uint64_t gather_layer_calls = 0;
++  uint64_t rebuild_layer_calls = 0;
++  uint64_t reuse_layer_calls = 0;
++  uint64_t delta_layer_calls = 0;
++  // Logical K+V elements gathered/appended, not measured device copy traffic;
++  // excludes zero-fill, allocator growth and possible copy-on-write traffic.
++  uint64_t copied_elements = 0;
++  // Source K+V scalars for every selected view, including ordinary gathers
++  // and appended tails. These are logical reads, not measured memory traffic.
++  uint64_t canonical_read_elements = 0;
++  // Current stable-slot patch reads all replacement rows from canonical KV.
++  uint64_t hot_read_elements = 0;
++  // Kept for comparison with the rejected sorted-delta experiment. Stable
++  // slots perform no full ordering gather, so this counter stays zero.
++  uint64_t delta_reorder_elements = 0;
++  size_t hot_payload_bytes = 0;
++  size_t hot_live_bytes = 0;
++  int hot_layers = 0;
++};
++
+ // Bool mask [1, 1, T, S] for T queries over a span of S keys, where each query
+ // attends at most `window` keys ending at itself. The span is right-aligned
+ // (the newest key belongs to the last query), so query i spans keys
+@@ -56,7 +132,12 @@ inline Tensor window_causal_mask(int T, int S, int window, StreamOrDevice s) {
+ class MLXSequenceCache : public cache::SequenceCache, public MLXCache {
+  public:
+   explicit MLXSequenceCache(const cache::CacheConfig& cfg)
+-      : cache::SequenceCache(checked(cfg)) {
++      : cache::SequenceCache(checked(cfg)), config_(cfg),
++        retained_layout_(cfg.capacity), layer_lengths_(size_t(cfg.n_layers), 0),
++        last_update_tokens_(size_t(cfg.n_layers), 0),
++        last_update_end_(size_t(cfg.n_layers), 0),
++        hot_attention_(size_t(cfg.n_layers)),
++        cold_layers_(size_t(cfg.n_layers)) {
+     const ::mlx::core::Dtype dt =
+         resolve_dtype(static_cast<int8_t>(cfg.kv_dtype));
+     kpool_.reserve(static_cast<size_t>(cfg.n_layers));
+@@ -72,26 +153,1181 @@ class MLXSequenceCache : public cache::SequenceCache, public MLXCache {
+       // small. A ring layer recycles a fixed window + max_write - 1 slots.
+       const int max_slots = ring ? lc.policy.window +
+               (cfg.max_write ? *cfg.max_write : lc.policy.window) - 1
+-                                 : cfg.capacity;
++                                 : allocation_capacity();
+       const int initial = ring ? max_slots : cfg.initial_capacity;
+       kpool_.emplace_back(initial, max_slots, lc.n_kv_heads, lc.head_dim, dt);
+       vpool_.emplace_back(initial, max_slots, lc.n_kv_heads, lc.head_dim, dt);
+     }
+   }
+ 
++  bool has_compacted_history() const { return retained_layout_.compacted(); }
++
++  // A transaction may publish one layer at a time. Generic/exported cache
++  // consumers must reject the representation as soon as ANY layer is cold.
++  bool has_cold_history() const {
++    return cold_layer_count_ != 0;
++  }
++
++  bool has_cold_history(int layer) const {
++    if (layer < 0 || layer >= config_.n_layers)
++      throw std::out_of_range("has_cold_history: invalid layer");
++    return cold_layers_[size_t(layer)].has_value();
++  }
++
++  int layer_cold_prefix_length(int layer) const {
++    return has_cold_history(layer) ? cold_layers_[size_t(layer)]->tokens : 0;
++  }
++
++  // Minimum absolute exclusive endpoint over every layer (dense layers = 0).
++  // The job frontier advances only after every layer reaches the new prefix.
++  int cold_prefix_length() const { return cold_tokens_; }
++
++  // Geometry-only receipt accessors: no root leases, evaluation or waiting.
++  int layer_allocated_slots(int layer) const {
++    if (layer < 0 || layer >= config_.n_layers)
++      throw std::out_of_range("layer_allocated_slots: invalid layer");
++    return kpool_[size_t(layer)].slots();
++  }
++
++  int layer_max_slots(int layer) const {
++    if (layer < 0 || layer >= config_.n_layers)
++      throw std::out_of_range("layer_max_slots: invalid layer");
++    return kpool_[size_t(layer)].max_slots();
++  }
++
++  // Cheap owner-thread threshold observation. nbytes() reads array geometry;
++  // it neither evaluates lazy roots nor requires completed GPU writes. This
++  // counts canonical owned payload capacity, not physical allocation or RSS.
++  size_t allocated_payload_bytes() const {
++    size_t bytes = 0;
++    for (const auto& root : storage_roots()) {
++      if (root.nbytes() > std::numeric_limits<size_t>::max() - bytes)
++        throw std::overflow_error("allocated_payload_bytes: byte count overflow");
++      bytes += root.nbytes();
++    }
++    return bytes;
++  }
++
++  // Position completeness is independent of representation precision. Do not
++  // use this admission for an ordinary full-FP16 AttendSpec consumer.
++  bool has_complete_history_positions() const {
++    return !pending_cold_install_ &&
++        (has_cold_history() || has_full_history_storage());
++  }
++
++  const ColdLayer& cold_layer(int layer) const {
++    if (layer < 0 || layer >= config_.n_layers || !has_cold_history(layer) ||
++        pending_cold_install_)
++      throw std::invalid_argument("cold_layer: no published cold prefix or invalid layer");
++    return *cold_layers_[size_t(layer)];
++  }
++
++  // Caller has drained the serialized owner. Absolute positions must lie in
++  // the not-yet-compressed FP16 suffix; old INT8 blocks are never decoded here.
++  // Returned views lease the current FP16 pool: release them after reading,
++  // before reporting that publication has released the superseded storage.
++  std::pair<Tensor, Tensor> read_frozen_block(
++      int layer, int start, int count, StreamOrDevice s = {}) const {
++    const int layer_cold = layer_cold_prefix_length(layer);
++    if (!has_complete_history_positions() || attention_selection_ ||
++        config_.kv_dtype != static_cast<int>(ScalarType::Half) ||
++        layer < 0 || layer >= config_.n_layers || start < layer_cold || count <= 0 ||
++        start > length() || count > length() - start ||
++        layer_lengths_[size_t(layer)] != length() ||
++        kpool_[size_t(layer)].slots() < length() - layer_cold ||
++        vpool_[size_t(layer)].slots() < length() - layer_cold)
++      throw std::invalid_argument("read_frozen_block: completed uncompressed FP16 suffix required");
++    std::vector<Tensor> roots;
++    for (int committed : layer_lengths_)
++      if (committed != length())
++        throw std::invalid_argument("read_frozen_block: every layer must be complete");
++    kpool_[size_t(layer)].append_storage(roots);
++    vpool_[size_t(layer)].append_storage(roots);
++    for (const auto& root : roots)
++      if (!root.is_available())
++        throw std::invalid_argument("read_frozen_block: source must already be complete");
++    return {kpool_[size_t(layer)].read(start - layer_cold, count, s),
++            vpool_[size_t(layer)].read(start - layer_cold, count, s)};
++  }
++
++  // Owner-only, nonblocking host snapshot of the uncompressed suffix. The
++  // caller must serialize this method with submissions/publication. No lazy
++  // view, evaluation or synchronization is created here. Keeping a view alive
++  // on the worker would prevent donation and make the next append copy the
++  // entire backing pool; only independent FP16 bits escape this method.
++  // False means the parents are not complete yet; outputs remain unchanged.
++  bool try_copy_frozen_block(int layer, int start, int count,
++                            std::vector<uint16_t>& keys,
++                            std::vector<uint16_t>& values) const {
++    const int layer_cold = layer_cold_prefix_length(layer);
++    if (&keys == &values || !has_complete_history_positions() || attention_selection_ ||
++        retained_layout_.compacted() || pending_compaction_ || pending_prefix_allocation_ ||
++        config_.kv_dtype != static_cast<int>(ScalarType::Half) ||
++        layer < 0 || layer >= config_.n_layers || start < layer_cold || count <= 0 ||
++        start > length() || count > length() - start)
++      throw std::invalid_argument("try_copy_frozen_block: distinct outputs and dense FP16 suffix required");
++    for (const auto& geometry : config_.layers)
++      if (geometry.policy.kind != cache::LayerPolicy::Kind::Flat || geometry.policy.window != 0 ||
++          geometry.n_kv_heads != 16 || geometry.head_dim != 128)
++        throw std::invalid_argument("try_copy_frozen_block: flat H16 D128 storage required");
++    for (int committed : layer_lengths_)
++      if (committed != length()) return false;
++    const size_t l = size_t(layer);
++    if (kpool_[l].slots() < length() - layer_cold ||
++        vpool_[l].slots() < length() - layer_cold)
++      throw std::invalid_argument("try_copy_frozen_block: suffix exceeds allocated parents");
++    std::vector<Tensor> roots;
++    roots.reserve(2);
++    kpool_[l].append_storage(roots);
++    vpool_[l].append_storage(roots);
++    if (roots.size() != 2)
++      throw std::invalid_argument("try_copy_frozen_block: missing parents");
++    for (const auto& root : roots)
++      if (!root.is_available()) return false;
++
++    // Inspect strides only after availability: lazy parent metadata may still
++    // describe the eventual output rather than its evaluated backing layout.
++    const auto checked_mul = [](size_t a, size_t b) {
++      if (b && a > std::numeric_limits<size_t>::max() / b)
++        throw std::invalid_argument("try_copy_frozen_block: stride extent overflow");
++      return a * b;
++    };
++    const auto checked_add = [](size_t a, size_t b) {
++      if (a > std::numeric_limits<size_t>::max() - b)
++        throw std::invalid_argument("try_copy_frozen_block: stride extent overflow");
++      return a + b;
++    };
++    const uint16_t* source[2];
++    size_t head_stride[2], token_stride[2];
++    for (size_t i = 0; i < roots.size(); ++i) {
++      const auto& root = roots[i];
++      const int slots = i == 0 ? kpool_[l].slots() : vpool_[l].slots();
++      if (root.shape() != ::mlx::core::Shape{1, 16, slots, 128} ||
++          root.dtype() != ::mlx::core::float16 || root.strides().size() != 4 ||
++          root.strides()[3] != 1 || root.strides()[2] < 128 || root.strides()[1] <= 0 ||
++          root.offset() < 0 || root.offset() % sizeof(uint16_t) != 0)
++        throw std::invalid_argument("try_copy_frozen_block: parent shape/dtype/strides differ");
++      head_stride[i] = size_t(root.strides()[1]);
++      token_stride[i] = size_t(root.strides()[2]);
++      if (head_stride[i] < checked_mul(size_t(slots), token_stride[i]))
++        throw std::invalid_argument("try_copy_frozen_block: overlapping parent heads");
++      const size_t extent = checked_add(checked_add(checked_mul(15, head_stride[i]),
++          checked_mul(size_t(slots - 1), token_stride[i])), 128);
++      const size_t end = checked_add(size_t(root.offset()), checked_mul(extent, sizeof(uint16_t)));
++      if (end > root.buffer_size())
++        throw std::invalid_argument("try_copy_frozen_block: parent span exceeds buffer");
++      source[i] = root.data<uint16_t>();
++      if (!source[i])
++        throw std::invalid_argument("try_copy_frozen_block: unavailable host pointer");
++    }
++    const size_t elements = checked_mul(checked_mul(16, size_t(count)), 128);
++    keys.resize(elements);
++    values.resize(elements);
++    const size_t physical = size_t(start - layer_cold);
++    for (size_t i = 0; i < roots.size(); ++i) {
++      auto& output = i == 0 ? keys : values;
++      for (size_t head = 0; head < 16; ++head) {
++        const auto* input = source[i] + head * head_stride[i] + physical * token_stride[i];
++        auto* destination = output.data() + head * size_t(count) * 128;
++        if (token_stride[i] == 128) {
++          std::memcpy(destination, input, size_t(count) * 128 * sizeof(uint16_t));
++        } else {
++          for (size_t token = 0; token < size_t(count); ++token)
++            std::memcpy(destination + token * 128, input + token * token_stride[i],
++                        128 * sizeof(uint16_t));
++        }
++      }
++    }
++    return true;
++  }
++
++  // Publish one complete layer after the caller has drained the owner. Only
++  // this layer's old roots are leased during conversion; successful return
++  // releases its superseded FP16 pool without waiting for other layers.
++  // Once preparation begins, failure keeps the candidate owned and rejects
++  // every subsequent cache operation until the owner retires the cache.
++  void install_cold_layer(int layer, ColdLayer cold, StreamOrDevice s = {}) {
++    using namespace ::mlx::core;
++    if (layer < 0 || layer >= config_.n_layers ||
++        !has_complete_history_positions() || attention_selection_ ||
++        config_.kv_dtype != static_cast<int>(ScalarType::Half))
++      throw std::invalid_argument("install_cold_layer: idle complete FP16 history required");
++    const size_t l = size_t(layer);
++    const int previous_length = length();
++    const int previous_maximum = allocation_capacity();
++    const int previous_cold = layer_cold_prefix_length(layer);
++    const int next_cold = cold.tokens;
++    if (next_cold <= previous_cold || next_cold > previous_length ||
++        next_cold >= previous_maximum)
++      throw std::invalid_argument("install_cold_layer: advancing in-range cold prefix required");
++    for (int committed : layer_lengths_)
++      if (committed != previous_length)
++        throw std::invalid_argument("install_cold_layer: incomplete forward");
++    const auto& geometry = config_.layers.size() == 1 ? config_.layers.front() : config_.layers[l];
++    const Shape codes{1, geometry.n_kv_heads, next_cold, geometry.head_dim / 4};
++    const Shape parameters{1, geometry.n_kv_heads, next_cold, geometry.head_dim / 64};
++    if (geometry.policy.kind != cache::LayerPolicy::Kind::Flat || geometry.policy.window != 0 ||
++        geometry.head_dim % 64 != 0 || hot_attention_[l] ||
++        kpool_[l].slots() < previous_length - previous_cold ||
++        vpool_[l].slots() < previous_length - previous_cold ||
++        kpool_[l].max_slots() != previous_maximum - previous_cold ||
++        vpool_[l].max_slots() != previous_maximum - previous_cold ||
++        cold.key_codes.shape() != codes || cold.value_codes.shape() != codes ||
++        cold.key_scales.shape() != parameters || cold.value_scales.shape() != parameters ||
++        cold.key_biases.shape() != parameters || cold.value_biases.shape() != parameters ||
++        cold.key_codes.dtype() != uint32 || cold.value_codes.dtype() != uint32 ||
++        cold.key_scales.dtype() != float16 || cold.value_scales.dtype() != float16 ||
++        cold.key_biases.dtype() != float16 || cold.value_biases.dtype() != float16 ||
++        !cold.key_codes.flags().row_contiguous || !cold.value_codes.flags().row_contiguous ||
++        !cold.key_scales.flags().row_contiguous || !cold.value_scales.flags().row_contiguous ||
++        !cold.key_biases.flags().row_contiguous || !cold.value_biases.flags().row_contiguous)
++      throw std::invalid_argument("install_cold_layer: layer geometry/precision differs");
++
++    std::vector<Tensor> old_roots;
++    old_roots.reserve(8);
++    kpool_[l].append_storage(old_roots);
++    vpool_[l].append_storage(old_roots);
++    if (cold_layers_[l]) {
++      const auto& old = *cold_layers_[l];
++      old_roots.insert(old_roots.end(), {old.key_codes, old.key_scales, old.key_biases,
++                                       old.value_codes, old.value_scales, old.value_biases});
++    }
++    for (const auto& root : old_roots)
++      if (!root.is_available())
++        throw std::invalid_argument("install_cold_layer: source must already be complete");
++    auto candidate = std::make_unique<PendingColdInstall>();
++    candidate->cold.emplace_back(std::move(cold));
++    candidate->keys.reserve(1);
++    candidate->values.reserve(1);
++    pending_cold_install_ = std::move(candidate);
++
++    const int hot_tokens = previous_length - next_cold;
++    const int hot_maximum = previous_maximum - next_cold;
++    const int newly_cold = next_cold - previous_cold;
++    const int initial = int(std::min<int64_t>(hot_maximum,
++        ((int64_t(std::max(hot_tokens, 1)) + 255) / 256) * 256));
++    const auto copy_hot = [&](const Pool& source) {
++      Pool result(initial, hot_maximum, geometry.n_kv_heads, geometry.head_dim, float16);
++      if (!hot_tokens) return result;
++      if (geometry.n_kv_heads > std::numeric_limits<int>::max() / source.slots())
++        throw std::overflow_error("install_cold_layer: source gather index overflow");
++      std::vector<int32_t> indices(size_t(geometry.n_kv_heads) * size_t(hot_tokens));
++      for (int head = 0; head < geometry.n_kv_heads; ++head)
++        for (int token = 0; token < hot_tokens; ++token)
++          indices[size_t(head) * size_t(hot_tokens) + size_t(token)] =
++              head * source.slots() + newly_cold + token;
++      const auto rows = take(reshape(source.read(0, source.slots(), s),
++                                    {geometry.n_kv_heads * source.slots(), geometry.head_dim}, s),
++                             array(indices.data(), {int(indices.size())}, int32), 0, s);
++      result.write(0, hot_tokens,
++                   reshape(rows, {1, geometry.n_kv_heads, hot_tokens, geometry.head_dim}, s), s);
++      return result;
++    };
++    pending_cold_install_->keys.push_back(copy_hot(kpool_[l]));
++    pending_cold_install_->values.push_back(copy_hot(vpool_[l]));
++    const auto& next = *pending_cold_install_->cold.front();
++    std::vector<Tensor> roots{next.key_codes, next.key_scales, next.key_biases,
++                              next.value_codes, next.value_scales, next.value_biases};
++    pending_cold_install_->keys.front().append_storage(roots);
++    pending_cold_install_->values.front().append_storage(roots);
++    eval(roots);
++    std::unordered_set<const void*> old_buffers;
++    for (auto& root : old_roots) old_buffers.insert(root.buffer().raw_ptr());
++    for (auto& root : roots)
++      if (!root.is_available() || old_buffers.count(root.buffer().raw_ptr()))
++        throw std::runtime_error("install_cold_layer: candidate incomplete or retains old storage");
++    if (length() != previous_length || allocation_capacity() != previous_maximum ||
++        layer_cold_prefix_length(layer) != previous_cold)
++      throw std::runtime_error("install_cold_layer: owner changed during conversion");
++    for (int committed : layer_lengths_)
++      if (committed != previous_length)
++        throw std::runtime_error("install_cold_layer: layer changed during conversion");
++
++    static_assert(std::is_nothrow_swappable_v<Pool> &&
++                  std::is_nothrow_swappable_v<std::optional<ColdLayer>>);
++    using std::swap;
++    swap(kpool_[l], pending_cold_install_->keys.front());
++    swap(vpool_[l], pending_cold_install_->values.front());
++    swap(cold_layers_[l], pending_cold_install_->cold.front());
++    if (previous_cold == 0) ++cold_layer_count_;
++    cold_tokens_ = std::numeric_limits<int>::max();
++    for (const auto& published : cold_layers_)
++      cold_tokens_ = std::min(cold_tokens_, published ? published->tokens : 0);
++    last_update_tokens_[l] = 0;
++    last_update_end_[l] = 0;
++    pending_cold_install_.reset();
++    old_roots.clear();
++  }
++
++  // Whole-history atomic control, retained for the same-binary comparison.
++  // Admission requires all current layer prefixes to share one endpoint.
++  // Advance the immutable prefix after the caller has drained the owner.
++  // `layers` contains the complete cumulative cold prefix: the caller reuses
++  // old INT8 values and appends newly encoded FP16 blocks without re-encoding.
++  // All candidate roots remain owned on failure for outer quarantine.
++  // The hot suffix is gathered into a genuinely independent allocation;
++  // retaining a slice of the original full pool would not release that pool.
++  void install_cold_history(std::vector<ColdLayer> layers, int cold_tokens,
++                            StreamOrDevice s = {}) {
++    using namespace ::mlx::core;
++    if (!has_complete_history_positions() || attention_selection_ ||
++        config_.kv_dtype != static_cast<int>(ScalarType::Half) ||
++        cold_tokens <= cold_tokens_ || cold_tokens > length() ||
++        cold_tokens >= allocation_capacity() || layers.size() != kpool_.size())
++      throw std::invalid_argument("install_cold_history: idle complete history and advancing cold prefix required");
++    const int previous_length = length();
++    const int previous_maximum = allocation_capacity();
++    const int previous_cold_tokens = cold_tokens_;
++    const int previous_hot_tokens = previous_length - previous_cold_tokens;
++    const int previous_hot_maximum = previous_maximum - previous_cold_tokens;
++    const int newly_cold_tokens = cold_tokens - previous_cold_tokens;
++    const int hot_tokens = previous_length - cold_tokens;
++    const int hot_maximum = previous_maximum - cold_tokens;
++    // Round the initial suffix allocation, never beyond the remaining logical
++    // request capacity. The neutral controller retains the original ceiling.
++    const int initial = int(std::min<int64_t>(hot_maximum,
++        ((int64_t(std::max(hot_tokens, 1)) + 255) / 256) * 256));
++    for (size_t l = 0; l < kpool_.size(); ++l) {
++      const auto& geometry = config_.layers.size() == 1 ? config_.layers.front() : config_.layers[l];
++      const Shape codes{1, geometry.n_kv_heads, cold_tokens, geometry.head_dim / 4};
++      const Shape scales{1, geometry.n_kv_heads, cold_tokens, geometry.head_dim / 64};
++      const auto& cold = layers[l];
++      if (layer_cold_prefix_length(int(l)) != previous_cold_tokens ||
++          layer_lengths_[l] != previous_length || hot_attention_[l] ||
++          kpool_[l].slots() < previous_hot_tokens || vpool_[l].slots() < previous_hot_tokens ||
++          kpool_[l].max_slots() != previous_hot_maximum || vpool_[l].max_slots() != previous_hot_maximum ||
++          cold.tokens != cold_tokens || cold.key_codes.shape() != codes ||
++          cold.value_codes.shape() != codes || cold.key_scales.shape() != scales ||
++          cold.value_scales.shape() != scales || cold.key_biases.shape() != scales ||
++          cold.value_biases.shape() != scales || geometry.head_dim % 64 != 0 ||
++          cold.key_codes.dtype() != uint32 || cold.value_codes.dtype() != uint32 ||
++          cold.key_scales.dtype() != float16 || cold.value_scales.dtype() != float16 ||
++          cold.key_biases.dtype() != float16 || cold.value_biases.dtype() != float16 ||
++          !cold.key_codes.flags().row_contiguous || !cold.value_codes.flags().row_contiguous ||
++          !cold.key_scales.flags().row_contiguous || !cold.value_scales.flags().row_contiguous ||
++          !cold.key_biases.flags().row_contiguous || !cold.value_biases.flags().row_contiguous)
++        throw std::invalid_argument("install_cold_history: layer geometry/precision differs");
++    }
++    auto old_roots = storage_roots();
++    for (const auto& root : old_roots)
++      if (!root.is_available())
++        throw std::invalid_argument("install_cold_history: source must already be complete");
++    auto candidate = std::make_unique<PendingColdInstall>();
++    candidate->cold.reserve(layers.size());
++    for (auto& layer : layers) candidate->cold.emplace_back(std::move(layer));
++    candidate->keys.reserve(kpool_.size());
++    candidate->values.reserve(vpool_.size());
++    pending_cold_install_ = std::move(candidate);
++    auto copy_hot = [&](const Pool& source, int heads, int dim) {
++      Pool result(initial, hot_maximum, heads, dim, float16);
++      if (!hot_tokens) return result;
++      if (heads > std::numeric_limits<int>::max() / source.slots())
++        throw std::overflow_error("install_cold_history: source gather index overflow");
++      std::vector<int32_t> indices(size_t(heads) * size_t(hot_tokens));
++      for (int head = 0; head < heads; ++head)
++        for (int token = 0; token < hot_tokens; ++token)
++          indices[size_t(head) * size_t(hot_tokens) + size_t(token)] =
++              head * source.slots() + newly_cold_tokens + token;
++      const auto rows = take(reshape(source.read(0, source.slots(), s),
++                                    {heads * source.slots(), dim}, s),
++                             array(indices.data(), {int(indices.size())}, int32), 0, s);
++      result.write(0, hot_tokens, reshape(rows, {1, heads, hot_tokens, dim}, s), s);
++      return result;
++    };
++    for (size_t l = 0; l < kpool_.size(); ++l) {
++      const auto& geometry = config_.layers.size() == 1 ? config_.layers.front() : config_.layers[l];
++      pending_cold_install_->keys.push_back(copy_hot(kpool_[l], geometry.n_kv_heads, geometry.head_dim));
++      pending_cold_install_->values.push_back(copy_hot(vpool_[l], geometry.n_kv_heads, geometry.head_dim));
++    }
++    std::vector<Tensor> roots;
++    roots.reserve(8 * kpool_.size());
++    for (size_t l = 0; l < kpool_.size(); ++l) {
++      const auto& cold = *pending_cold_install_->cold[l];
++      roots.insert(roots.end(), {cold.key_codes, cold.key_scales, cold.key_biases, cold.value_codes, cold.value_scales, cold.value_biases});
++      pending_cold_install_->keys[l].append_storage(roots);
++      pending_cold_install_->values[l].append_storage(roots);
++    }
++    eval(roots);
++    std::unordered_set<const void*> old_buffers;
++    for (auto& root : old_roots) old_buffers.insert(root.buffer().raw_ptr());
++    for (auto& root : roots)
++      if (!root.is_available() || old_buffers.count(root.buffer().raw_ptr()))
++        throw std::runtime_error("install_cold_history: candidate incomplete or retains original pool");
++    if (length() != previous_length || allocation_capacity() != previous_maximum ||
++        cold_tokens_ != previous_cold_tokens)
++      throw std::runtime_error("install_cold_history: owner changed during conversion");
++    for (int committed : layer_lengths_)
++      if (committed != previous_length)
++        throw std::runtime_error("install_cold_history: layer changed during conversion");
++    // No allocations/device work after this publication point. Superseded
++    // cold roots and hot pools are destroyed below; temporary old_roots leases
++    // are also released here. The logical absolute position is unchanged.
++    kpool_.swap(pending_cold_install_->keys);
++    vpool_.swap(pending_cold_install_->values);
++    cold_layers_.swap(pending_cold_install_->cold);
++    cold_layer_count_ = config_.n_layers;
++    cold_tokens_ = cold_tokens;
++    std::fill(last_update_tokens_.begin(), last_update_tokens_.end(), 0);
++    std::fill(last_update_end_.begin(), last_update_end_.end(), 0);
++    pending_cold_install_.reset();
++    old_roots.clear();
++  }
++
++  // Explicit T1-only mapping. Returned AttendSpec contains only the hot suffix;
++  // callers must use cold_layer() and a compressed-attention implementation.
++  AttendSpec update_cold_and_fetch(int layer, const std::vector<int32_t>& positions,
++                                  const Tensor& k, const Tensor& v, StreamOrDevice s) {
++    if (layer < 0 || layer >= config_.n_layers || !has_cold_history(layer) || pending_cold_install_)
++      throw std::invalid_argument("update_cold_and_fetch: published cold history required");
++    const size_t l = size_t(layer);
++    const int layer_cold = layer_cold_prefix_length(layer);
++    const auto& geometry = config_.layers.size() == 1 ? config_.layers.front() : config_.layers[l];
++    const ::mlx::core::Shape shape{1, geometry.n_kv_heads, 1, geometry.head_dim};
++    if (positions.size() != 1 || positions[0] != layer_lengths_[l] ||
++        positions[0] < layer_cold || positions[0] >= allocation_capacity() ||
++        k.shape() != shape || v.shape() != shape ||
++        k.dtype() != ::mlx::core::float16 || v.dtype() != ::mlx::core::float16)
++      throw std::invalid_argument("update_cold_and_fetch: ordered FP16 T1 append required");
++    const int start = positions[0];
++    const auto absolute = cache::SequenceCache::plan(layer, start, 1);
++    if (!absolute) throw std::runtime_error("update_cold_and_fetch: absolute capacity exceeded");
++    const int physical = start - layer_cold;
++    kpool_[l].write(physical, 1, k, s);
++    vpool_[l].write(physical, 1, v, s);
++    Tensor keys = kpool_[l].read(0, physical + 1, s);
++    Tensor values = vpool_[l].read(0, physical + 1, s);
++    layer_lengths_[l] = start + 1;
++    last_update_tokens_[l] = 1;
++    last_update_end_[l] = start + 1;
++    cache::SequenceCache::commit(*absolute);
++    return AttendSpec{keys, values, AttendSpec::Mask::None, std::nullopt};
++  }
++
++  // Native-only dense layer append during a mixed publication. The ordinary
++  // MLXCache override and exported plan/commit continue to reject ANY cold
++  // layer. This bypass admits only an ordered FP16 T1 for a still-dense layer.
++  AttendSpec update_dense_t1_and_fetch(int layer, const std::vector<int32_t>& positions,
++                                      const Tensor& k, const Tensor& v, StreamOrDevice s) {
++    if (layer < 0 || layer >= config_.n_layers || pending_cold_install_ ||
++        !has_cold_history() || has_cold_history(layer) || attention_selection_)
++      throw std::invalid_argument("update_dense_t1_and_fetch: mixed history and dense layer required");
++    const size_t l = size_t(layer);
++    const auto& geometry = config_.layers.size() == 1 ? config_.layers.front() : config_.layers[l];
++    const ::mlx::core::Shape shape{1, geometry.n_kv_heads, 1, geometry.head_dim};
++    if (geometry.policy.kind != cache::LayerPolicy::Kind::Flat || geometry.policy.window != 0 ||
++        config_.kv_dtype != static_cast<int>(ScalarType::Half) ||
++        positions.size() != 1 || positions[0] != layer_lengths_[l] ||
++        positions[0] < 0 || positions[0] >= allocation_capacity() ||
++        k.shape() != shape || v.shape() != shape ||
++        k.dtype() != ::mlx::core::float16 || v.dtype() != ::mlx::core::float16)
++      throw std::invalid_argument("update_dense_t1_and_fetch: ordered full-history FP16 T1 required");
++    const int start = positions[0];
++    const auto absolute = cache::SequenceCache::plan(layer, start, 1);
++    if (!absolute) throw std::runtime_error("update_dense_t1_and_fetch: absolute capacity exceeded");
++    kpool_[l].write(start, 1, k, s);
++    vpool_[l].write(start, 1, v, s);
++    Tensor keys = kpool_[l].read(0, start + 1, s);
++    Tensor values = vpool_[l].read(0, start + 1, s);
++    layer_lengths_[l] = start + 1;
++    last_update_tokens_[l] = 1;
++    last_update_end_[l] = start + 1;
++    cache::SequenceCache::commit(*absolute);
++    return AttendSpec{keys, values, AttendSpec::Mask::None, std::nullopt};
++  }
++
++  uint64_t attention_selection_layer_calls() const { return attention_selection_layer_calls_; }
++  bool has_attention_selection() const { return bool(attention_selection_); }
++
++  // Owner-thread only, after previous work completes. Default remains gather.
++  void set_attention_selection_reuse(bool enabled) {
++    if (attention_selection_stats_.reuse_enabled == enabled) return;
++    clear_hot_attention();
++    attention_selection_stats_.reuse_enabled = enabled;
++  }
++
++  // Independent opt-in; effective only while ordinary hot reuse is enabled.
++  void set_attention_selection_delta_reuse(bool enabled) {
++    if (attention_selection_stats_.delta_reuse_enabled == enabled) return;
++    clear_hot_attention();
++    attention_selection_stats_.delta_reuse_enabled = enabled;
++  }
++
++  static const char* attention_selection_delta_layout() { return "stable_slots_canonical_patch_v2"; }
++
++  AttentionSelectionStats attention_selection_stats() const {
++    auto result = attention_selection_stats_;
++    for (const auto& hot : hot_attention_) {
++      if (!hot) continue;
++      ++result.hot_layers;
++      std::vector<Tensor> roots;
++      hot->keys.append_storage(roots);
++      hot->values.append_storage(roots);
++      for (const auto& root : roots) {
++        result.hot_payload_bytes += root.nbytes();
++        result.hot_live_bytes += root.nbytes() / size_t(root.shape(2)) * size_t(hot->count);
++      }
++    }
++    return result;
++  }
++
++  // Owner-thread publication only, between complete forwards. Epoch/proposal
++  // admission belongs to the mailbox owner; this cache validates storage and
++  // indices. The shared proposal must remain immutable after publication.
++  void set_attention_selection(std::shared_ptr<const cache::AttentionSelection> selection) {
++    if (!selection) {
++      attention_selection_.reset();
++      attention_indices_.reset();
++      clear_hot_attention();
++      return;
++    }
++    if (selection == attention_selection_) return;
++    if (!has_full_history_storage() || selection->covered_length <= 0 ||
++        selection->covered_length > length() ||
++        selection->valid_until_position < selection->covered_length ||
++        selection->valid_until_position > capacity())
++      throw std::invalid_argument("attention selection requires committed full history and valid coverage");
++    const int heads = config_.layers.front().n_kv_heads;
++    if (selection->positions_by_head.size() != size_t(heads))
++      throw std::invalid_argument("attention selection must cover every KV head");
++    for (const auto& layer : config_.layers) {
++      if (layer.n_kv_heads != heads)
++        throw std::invalid_argument("attention selection requires uniform KV head counts");
++    }
++    for (int committed : layer_lengths_) {
++      if (committed != length())
++        throw std::invalid_argument("attention selection publication requires a complete forward");
++    }
++    const size_t count = selection->positions_by_head.front().size();
++    if (!count || count > size_t(selection->covered_length))
++      throw std::invalid_argument("attention selection has an invalid per-head count");
++    for (const auto& positions : selection->positions_by_head) {
++      if (positions.size() != count)
++        throw std::invalid_argument("attention selection per-head counts differ");
++      int previous = -1;
++      for (int position : positions) {
++        if (position <= previous || position >= selection->covered_length)
++          throw std::invalid_argument("attention selection positions must be ordered covered history");
++        previous = position;
++      }
++    }
++    const bool keep_hot = attention_selection_stats_.reuse_enabled &&
++        attention_selection_stats_.delta_reuse_enabled && attention_selection_ &&
++        attention_selection_->request_epoch == selection->request_epoch &&
++        count < size_t(selection->covered_length);
++    // The old proposal may expire exactly before this replacement. Its stored
++    // KV remains valid until a rewrite/reset; expiry only disallows using that
++    // proposal for attention. An already-observed expiry clears hot normally.
++    attention_selection_ = std::move(selection);
++    attention_indices_.reset();
++    delta_plan_.reset();
++    initial_hot_layout_.reset();
++    if (!keep_hot) clear_hot_attention();
++  }
++
++  // A reversible attention view; never replaces or truncates the backing KV.
++  // Only the native T1 path calls this, after validating its full AttendSpec.
++  AttendSpec select_for_attention(int layer, const AttendSpec& full, StreamOrDevice s = {}) {
++    if (!attention_selection_ || !has_full_history_storage() || layer < 0 ||
++        layer >= config_.n_layers || full.kind != AttendSpec::Mask::None || full.mask)
++      return full;
++    const size_t l = size_t(layer);
++    const int end = last_update_end_[l];
++    if (last_update_tokens_[l] != 1 || end <= 0 || end > capacity() ||
++        end != layer_lengths_[l]) {
++      hot_attention_[l].reset();
++      return full;
++    }
++    const auto selection = attention_selection_;
++    const int current_position = end - 1;
++    if (current_position > selection->valid_until_position) {
++      set_attention_selection(nullptr);
++      return full;
++    }
++    const auto& geometry = config_.layers.size() == 1 ? config_.layers.front() : config_.layers[l];
++    const ::mlx::core::Shape expected{1, geometry.n_kv_heads, end, geometry.head_dim};
++    if (full.K.shape() != expected || full.V.shape() != expected ||
++        full.K.dtype() != full.V.dtype() || selection->covered_length <= 0 ||
++        selection->covered_length > current_position ||
++        selection->positions_by_head.size() != size_t(geometry.n_kv_heads)) {
++      hot_attention_[l].reset();
++      return full;
++    }
++    const size_t selected = selection->positions_by_head.front().size();
++    const int tail = end - selection->covered_length;
++    if (!selected || selected > size_t(selection->covered_length)) return full;
++    if (selected == size_t(selection->covered_length)) return full;
++    const int count = int(selected) + tail;
++    if (attention_selection_stats_.reuse_enabled && hot_attention_[l] &&
++        hot_attention_[l]->selection == selection &&
++        hot_attention_[l]->end >= end - 1 && hot_attention_[l]->end <= end) {
++      auto& hot = *hot_attention_[l];
++      const int added = end - hot.end;
++      if (added) {
++        const ::mlx::core::Shape start{0, 0, end - 1, 0};
++        const ::mlx::core::Shape stop{1, geometry.n_kv_heads, end, geometry.head_dim};
++        hot.keys.write(hot.count, 1, ::mlx::core::slice(full.K, start, stop, s), s);
++        hot.values.write(hot.count, 1, ::mlx::core::slice(full.V, start, stop, s), s);
++        hot.end = end;
++        hot.count = count;
++      }
++      AttendSpec view{hot.keys.read(0, count, s), hot.values.read(0, count, s),
++                      AttendSpec::Mask::None, std::nullopt};
++      ++attention_selection_stats_.reuse_layer_calls;
++      attention_selection_stats_.copied_elements +=
++          uint64_t(2) * geometry.n_kv_heads * added * geometry.head_dim;
++      attention_selection_stats_.canonical_read_elements +=
++          uint64_t(2) * geometry.n_kv_heads * added * geometry.head_dim;
++      ++attention_selection_layer_calls_;
++      return view;
++    }
++    const int maximum_end = int(std::min<int64_t>(allocation_capacity(),
++        int64_t(selection->valid_until_position) + 1));
++    const int maximum = int(selected) + maximum_end - selection->covered_length;
++    if (attention_selection_stats_.reuse_enabled && attention_selection_stats_.delta_reuse_enabled &&
++        hot_attention_[l] && hot_attention_[l]->layout && hot_attention_[l]->selection != selection &&
++        hot_attention_[l]->selection->request_epoch == selection->request_epoch &&
++        hot_attention_[l]->end <= end && hot_attention_[l]->keys.slots() >= maximum &&
++        hot_attention_[l]->values.slots() >= maximum) {
++      auto& hot = *hot_attention_[l];
++      if (!delta_plan_ || delta_plan_->source != hot.layout ||
++          delta_plan_->source_end != hot.end || delta_plan_->end != end)
++        delta_plan_ = make_delta_plan(hot, *selection, end);
++      const auto& plan = *delta_plan_;
++      auto patch = [&](Pool& pool, const Tensor& canonical) {
++        if (!plan.destinations) return;
++        // Even relocated survivors are read from canonical KV. Gathering from
++        // the old hot root would retain its buffer through GPU completion and
++        // can prevent donation to the following same-shape scatter.
++        Tensor rows = ::mlx::core::gather(canonical,
++            {*plan.heads, *plan.positions}, {1, 2}, {1, 1, 1, geometry.head_dim}, s);
++        pool.write_head_cells(*plan.destinations, rows, s);
++      };
++      patch(hot.keys, full.K); patch(hot.values, full.V);
++      hot.selection = selection; hot.layout = plan.destination; hot.end = end; hot.count = count;
++      AttendSpec view{hot.keys.read(0, count, s), hot.values.read(0, count, s),
++                      AttendSpec::Mask::None, std::nullopt};
++      ++attention_selection_stats_.delta_layer_calls;
++      attention_selection_stats_.canonical_read_elements += uint64_t(2) * plan.rows * geometry.head_dim;
++      attention_selection_stats_.copied_elements += uint64_t(2) * plan.rows * geometry.head_dim;
++      ++attention_selection_layer_calls_;
++      return view;
++    }
++    // One immutable index array per T1 position, shared by all model layers.
++    if (!attention_indices_ || attention_indices_end_ != end) {
++      std::vector<int32_t> positions;
++      positions.reserve(size_t(geometry.n_kv_heads) * size_t(count));
++      for (const auto& head : selection->positions_by_head) {
++        if (head.size() != selected) return full;
++        int previous = -1;
++        for (int position : head) {
++          if (position <= previous || position >= selection->covered_length) return full;
++          positions.push_back(position);
++          previous = position;
++        }
++        for (int position = selection->covered_length; position < end; ++position)
++          positions.push_back(position);
++      }
++      attention_indices_ = Tensor(positions.data(), {1, geometry.n_kv_heads, count, 1}, ::mlx::core::int32);
++      attention_indices_end_ = end;
++    }
++    AttendSpec selected_view{
++        ::mlx::core::take_along_axis(full.K, *attention_indices_, 2, s),
++        ::mlx::core::take_along_axis(full.V, *attention_indices_, 2, s),
++        AttendSpec::Mask::None, std::nullopt};
++    if (attention_selection_stats_.reuse_enabled) {
++      // Bound the extra allocation to this proposal's remaining lifetime;
++      // preallocate it so each subsequent T1 does not grow/copy the hot prefix.
++      auto hot = std::make_unique<HotAttention>(maximum, geometry.n_kv_heads,
++                                               geometry.head_dim, full.K.dtype());
++      hot->keys.write(0, count, selected_view.K, s);
++      hot->values.write(0, count, selected_view.V, s);
++      hot->end = end;
++      hot->count = count;
++      hot->selection = selection;
++      if (attention_selection_stats_.delta_reuse_enabled) {
++        if (!initial_hot_layout_ || initial_hot_layout_->base_end != end) {
++          auto layout = std::make_shared<HotSlotLayout>();
++          layout->base_end = end;
++          layout->positions_by_head = selection->positions_by_head;
++          for (auto& head : layout->positions_by_head)
++            for (int position = selection->covered_length; position < end; ++position) head.push_back(position);
++          initial_hot_layout_ = std::move(layout);
++        }
++        hot->layout = initial_hot_layout_;
++      }
++      selected_view = AttendSpec{hot->keys.read(0, count, s), hot->values.read(0, count, s),
++                                 AttendSpec::Mask::None, std::nullopt};
++      hot_attention_[l] = std::move(hot);
++      ++attention_selection_stats_.rebuild_layer_calls;
++    }
++    ++attention_selection_stats_.gather_layer_calls;
++    attention_selection_stats_.copied_elements +=
++        uint64_t(2) * geometry.n_kv_heads * count * geometry.head_dim;
++    attention_selection_stats_.canonical_read_elements +=
++        uint64_t(2) * geometry.n_kv_heads * count * geometry.head_dim;
++    ++attention_selection_layer_calls_;
++    return selected_view;
++  }
++
++  int allocation_capacity() const {
++    return config_.allocation_capacity.value_or(config_.capacity);
++  }
++
++  void validate_request_allocation(std::optional<int> maximum) const {
++    if (!has_full_history_storage() ||
++        (maximum && (*maximum <= 0 || *maximum > config_.capacity))) {
++      throw std::invalid_argument("Request allocation requires full-history storage and a valid ceiling");
++    }
++  }
++
++  // The owner must synchronize before releasing pools. Keep this cache object:
++  // loaded delegates retain its address, not just its registry key.
++  void reset_request_allocation(std::optional<int> maximum) {
++    validate_request_allocation(maximum);
++    config_.allocation_capacity = maximum;
++    reset_storage();
++  }
++
++  void validate_prefix_allocation(int keep, std::optional<int> maximum) const {
++    validate_request_allocation(maximum);
++    const int next_maximum = maximum.value_or(config_.capacity);
++    if (pending_prefix_allocation_ || attention_selection_ || attention_indices_ ||
++        delta_plan_ || initial_hot_layout_ || keep < 0 || keep > length() ||
++        keep > next_maximum) {
++      throw std::invalid_argument("Prefix allocation requires idle dense full history and a valid prefix");
++    }
++    for (size_t layer = 0; layer < kpool_.size(); ++layer) {
++      if (layer_lengths_[layer] != length() || hot_attention_[layer] ||
++          kpool_[layer].slots() != vpool_[layer].slots() ||
++          kpool_[layer].max_slots() != allocation_capacity() ||
++          vpool_[layer].max_slots() != allocation_capacity() ||
++          kpool_[layer].slots() < length()) {
++        throw std::invalid_argument("Prefix allocation requires every layer's completed history");
++      }
++    }
++    for (const auto& root : storage_roots()) {
++      if (!root.is_available()) {
++        throw std::invalid_argument("Prefix allocation requires prior storage completion");
++      }
++    }
++  }
++
++  // Caller has drained and serialized the owner. Keep this cache object's
++  // address and original logical/RoPE capacity. Candidate pools remain owned
++  // if construction/evaluation fails so the owner can quarantine them.
++  void retain_prefix_allocation(int keep, std::optional<int> maximum, StreamOrDevice s = {}) {
++    validate_prefix_allocation(keep, maximum);
++    const int previous_length = length();
++    const auto previous_maximum = config_.allocation_capacity;
++    const int next_maximum = maximum.value_or(config_.capacity);
++    pending_prefix_allocation_ = std::make_unique<PendingPrefixAllocation>();
++    pending_prefix_allocation_->keys.reserve(kpool_.size());
++    pending_prefix_allocation_->values.reserve(vpool_.size());
++    bool copied = false;
++    for (size_t layer = 0; layer < kpool_.size(); ++layer) {
++      copied = copied || (keep > 0 && kpool_[layer].slots() > next_maximum);
++      pending_prefix_allocation_->keys.push_back(kpool_[layer].prefix_allocation(keep, next_maximum, s));
++      pending_prefix_allocation_->values.push_back(vpool_[layer].prefix_allocation(keep, next_maximum, s));
++    }
++    if (copied) {
++      std::vector<Tensor> roots;
++      roots.reserve(2 * kpool_.size());
++      for (size_t layer = 0; layer < kpool_.size(); ++layer) {
++        pending_prefix_allocation_->keys[layer].append_storage(roots);
++        pending_prefix_allocation_->values[layer].append_storage(roots);
++      }
++      ::mlx::core::eval(roots);
++    }
++    if (length() != previous_length || config_.allocation_capacity != previous_maximum ||
++        !cache::SequenceCache::rewind(keep)) {
++      throw std::runtime_error("Prefix allocation changed during preparation");
++    }
++    // All admission and device work precede publication; these swaps/fills
++    // allocate nothing. This is contiguous full history, never compaction.
++    kpool_.swap(pending_prefix_allocation_->keys);
++    vpool_.swap(pending_prefix_allocation_->values);
++    config_.allocation_capacity = maximum;
++    std::fill(layer_lengths_.begin(), layer_lengths_.end(), keep);
++    std::fill(last_update_tokens_.begin(), last_update_tokens_.end(), 0);
++    std::fill(last_update_end_.begin(), last_update_end_.end(), 0);
++    pending_prefix_allocation_.reset();
++  }
++
++  bool can_extend(int n = 1) const override {
++    const int maximum = allocation_capacity();
++    return n >= 0 && length() <= maximum && n <= maximum - length();
++  }
++
++  // Tensor-free admission for a native partial prefill. A ring that has not
++  // wrapped yet still is not a full-history owner. Default native T1 retains
++  // its separately admitted retained-history behavior.
++  bool has_full_history_storage() const {
++    if (has_cold_history() || pending_cold_install_ || retained_layout_.compacted() ||
++        pending_compaction_ || pending_prefix_allocation_) return false;
++    for (const auto& layer : config_.layers) {
++      if (layer.policy.kind != cache::LayerPolicy::Kind::Flat || layer.policy.window != 0)
++        return false;
++    }
++    return true;
++  }
++
++  int retained_length(int layer) const {
++    if (layer < 0 || layer >= config_.n_layers)
++      throw std::out_of_range("retained_length: invalid layer");
++    return retained_layout_.retained_length(layer_lengths_[size_t(layer)]);
++  }
++
++  // Pure admission; safe to call before marking a resident action dispatched.
++  void validate_compact_retained(const std::vector<int32_t>& positions) const {
++    if (has_cold_history() || pending_cold_install_)
++      throw std::runtime_error("compact_retained: cold representation is unsupported");
++    if (config_.allocation_capacity)
++      throw std::runtime_error("compact_retained: explicit allocation ceiling is unsupported");
++    if (pending_compaction_)
++      throw std::runtime_error("compact_retained: previous completion is unknown");
++    for (const auto& layer : config_.layers) {
++      if (layer.policy.kind != cache::LayerPolicy::Kind::Flat || layer.policy.window != 0)
++        throw std::runtime_error("compact_retained: flat storage is required");
++    }
++    (void)retained_layout_.prepare_compaction(positions, length(), layer_lengths_);
++    for (size_t layer = 0; layer < kpool_.size(); ++layer) {
++      const int live = retained_length(int(layer));
++      if (kpool_[layer].slots() < live || vpool_[layer].slots() < live)
++        throw std::runtime_error("compact_retained: committed bytes are unavailable");
++    }
++  }
++
++  // Caller serializes this operation against execution. Build and evaluate all
++  // new allocations before publishing any layer. Original RoPE coordinates and
++  // the absolute next-token position do not change. Old roots may still be held
++  // by an external reader or MLX's allocator; this does not promise RSS release.
++  void compact_retained(const std::vector<int32_t>& positions, StreamOrDevice s = {}) {
++    validate_compact_retained(positions);
++    auto plan = retained_layout_.prepare_compaction(positions, length(), layer_lengths_);
++    auto candidate = std::make_unique<PendingCompaction>();
++    candidate->keys.reserve(kpool_.size());
++    candidate->values.reserve(vpool_.size());
++    for (size_t layer = 0; layer < kpool_.size(); ++layer) {
++      candidate->keys.push_back(kpool_[layer].compact_copy(plan.source_slots(), plan.max_physical_slots(), s));
++      candidate->values.push_back(vpool_[layer].compact_copy(plan.source_slots(), plan.max_physical_slots(), s));
++    }
++    pending_compaction_ = std::move(candidate);
++    std::vector<Tensor> roots;
++    roots.reserve(2 * kpool_.size());
++    for (size_t layer = 0; layer < kpool_.size(); ++layer) {
++      pending_compaction_->keys[layer].append_storage(roots);
++      pending_compaction_->values[layer].append_storage(roots);
++    }
++    ::mlx::core::eval(roots);
++    if (!retained_layout_.can_publish(plan, layer_lengths_))
++      throw std::runtime_error("compact_retained: cache changed during preparation");
++    // No allocations or device work occur after this publication boundary.
++    if (!retained_layout_.publish(std::move(plan), layer_lengths_))
++      throw std::runtime_error("compact_retained: stale publication");
++    kpool_.swap(pending_compaction_->keys);
++    vpool_.swap(pending_compaction_->values);
++    set_attention_selection(nullptr);
++    pending_compaction_.reset();
++    pending_prefix_allocation_.reset();
++  }
++
++  RetainedStorageStats storage_stats() const {
++    if (pending_cold_install_)
++      throw std::runtime_error("storage_stats: cold conversion completion is unknown");
++    RetainedStorageStats result{length(), retained_length(0), 0, 0};
++    result.logical_capacity = config_.capacity;
++    result.allocation_capacity = allocation_capacity();
++    result.allocated_slots_per_layer.reserve(kpool_.size());
++    result.max_slots_per_layer.reserve(kpool_.size());
++    result.cold_prefix_tokens_per_layer.reserve(kpool_.size());
++    for (int layer = 0; layer < config_.n_layers; ++layer) {
++      const size_t index = static_cast<size_t>(layer);
++      if (layer_lengths_[index] != length() || retained_length(layer) != result.retained_tokens ||
++          kpool_[index].slots() != vpool_[index].slots() ||
++          kpool_[index].max_slots() != vpool_[index].max_slots())
++        throw std::runtime_error("storage_stats: incomplete layer transaction");
++      result.allocated_slots_per_layer.push_back(kpool_[index].slots());
++      result.max_slots_per_layer.push_back(kpool_[index].max_slots());
++      result.cold_prefix_tokens_per_layer.push_back(layer_cold_prefix_length(layer));
++    }
++    std::unordered_set<const void*> buffers;
++    auto roots = storage_roots();
++    for (auto& root : roots) {
++      if (!root.is_available()) throw std::runtime_error("storage_stats: synchronize storage first");
++      result.payload_bytes += root.nbytes();
++      if (buffers.insert(root.buffer().raw_ptr()).second) result.buffer_bytes += root.buffer_size();
++    }
++    for (size_t l = 0; l < cold_layers_.size(); ++l) {
++      if (cold_layers_[l]) {
++        const auto& cold = *cold_layers_[l];
++        result.cold_payload_bytes += cold.key_codes.nbytes() + cold.key_scales.nbytes() +
++            cold.key_biases.nbytes() + cold.value_codes.nbytes() + cold.value_scales.nbytes() + cold.value_biases.nbytes();
++      } else if (config_.kv_dtype == static_cast<int>(ScalarType::Half)) {
++        // Only unconverted layers still own an original full FP16 pool.
++        // Converted layers own a new, independent hot suffix allocation.
++        std::vector<Tensor> dense;
++        kpool_[l].append_storage(dense);
++        vpool_[l].append_storage(dense);
++        for (const auto& root : dense) result.original_fp16_owner_bytes += root.nbytes();
++      }
++    }
++    if (has_cold_history())
++      result.hot_payload_bytes = result.payload_bytes - result.cold_payload_bytes;
++    return result;
++  }
++
++  // A compressed prefix is a different attention history. Rewinding it would
++  // require a separately specified retention/rollback policy, so only a no-op
++  // is allowed. Existing full-history and ring rollback retain their behavior.
++  bool rewind(int new_len) override {
++    if (has_cold_history() || pending_cold_install_) return false;
++    if (has_compacted_history()) return new_len == length();
++    if (!cache::SequenceCache::rewind(new_len)) return false;
++    set_attention_selection(nullptr);
++    std::fill(last_update_tokens_.begin(), last_update_tokens_.end(), 0);
++    std::fill(layer_lengths_.begin(), layer_lengths_.end(), new_len);
++    return true;
++  }
++
++  void clear() override {
++    if (has_cold_history() || pending_cold_install_) { reset_storage(); return; }
++    set_attention_selection(nullptr);
++    std::fill(last_update_tokens_.begin(), last_update_tokens_.end(), 0);
++    if (has_compacted_history()) { reset_storage(); return; }
++    cache::SequenceCache::clear();
++    std::fill(layer_lengths_.begin(), layer_lengths_.end(), 0);
++  }
++
++  std::optional<cache::SeqStepPlan> plan(int layer, int position, int T) const override {
++    // Generic exported planners must not treat absolute positions as compact
++    // slots. The native update path below performs its own explicit mapping.
++    if (has_cold_history() || pending_cold_install_ || has_compacted_history()) return std::nullopt;
++    const int maximum = allocation_capacity();
++    if (position < 0 || T < 0 || position > maximum || T > maximum - position)
++      return std::nullopt;
++    return cache::SequenceCache::plan(layer, position, T);
++  }
++
++  void commit(const cache::SeqStepPlan& step) override {
++    if (has_cold_history() || pending_cold_install_)
++      throw std::runtime_error("commit: cold storage requires explicit T1 append");
++    // Validate the absolute end before the neutral controller can advance it.
++    // Read runs are physical, but read_base_pos is an absolute position for
++    // both flat and ring layouts. Use a wide sum before narrowing in the base.
++    if (step.n_read < 0 || step.n_read > 2 || step.n_write < 0 || step.n_write > 2 ||
++        step.read_base_pos < 0)
++      throw std::runtime_error("commit: invalid sequence step");
++    int64_t end = step.read_base_pos;
++    for (int i = 0; i < step.n_read; ++i) {
++      if (step.read[i].start < 0 || step.read[i].len < 0)
++        throw std::runtime_error("commit: invalid read run");
++      end += step.read[i].len;
++    }
++    if (end > allocation_capacity())
++      throw std::runtime_error("commit: allocation ceiling exceeded");
++    for (int i = 0; i < step.n_write; ++i) {
++      if (step.write[i].start < 0 || step.write[i].len < 0 ||
++          (config_.allocation_capacity &&
++           static_cast<int64_t>(step.write[i].start) + step.write[i].len > allocation_capacity()))
++        throw std::runtime_error("commit: invalid write run");
++    }
++    cache::SequenceCache::commit(step);
++  }
++
++  // These four methods and delegate execution must be serialized by the
++  // caller. They do not support ring layouts, heterogeneous heads/dimensions,
++  // non-FP32 storage, rewind conversion, or concurrent cache modification.
++  // The outer runner owns readiness/invalidity and the successful-step commit.
++  FlatFP32State export_flat_fp32(int committed_length, StreamOrDevice s = {}) {
++    FlatFP32State state = flat_shape(committed_length);
++    if (committed_length != length()) {
++      throw std::runtime_error("export_flat_fp32: outer committed length differs from cache");
++    }
++    const size_t count = flat_elements(state);
++    state.keys.resize(count);
++    state.values.resize(count);
++    synchronize_flat();
++    const size_t per_layer = count / static_cast<size_t>(state.layers);
++    for (size_t layer = 0; layer < kpool_.size(); ++layer) {
++      if (kpool_[layer].slots() < committed_length || vpool_[layer].slots() < committed_length) {
++        throw std::runtime_error("export_flat_fp32: committed prefix is not allocated in every layer");
++      }
++      const auto keys = kpool_[layer].export_flat_fp32(s);
++      const auto values = vpool_[layer].export_flat_fp32(s);
++      std::memcpy(state.keys.data() + layer * per_layer, keys.data(), per_layer * sizeof(float));
++      std::memcpy(state.values.data() + layer * per_layer, values.data(), per_layer * sizeof(float));
++    }
++    return state;
++  }
++
++  // Validate all host bytes first. Preparation/evaluation uses private pools;
++  // failure leaves this cache's arrays and logical length unchanged. Publishing
++  // uses only nonthrowing vector swaps and the existing neutral planner commit.
++  void import_flat_fp32(const FlatFP32State& state, StreamOrDevice s = {}) {
++    const FlatFP32State expected = flat_shape(state.valid_length);
++    if (state.layers != expected.layers || state.heads != expected.heads ||
++        state.capacity != expected.capacity || state.head_dim != expected.head_dim) {
++      throw std::runtime_error("import_flat_fp32: state geometry differs from cache");
++    }
++    const size_t count = flat_elements(expected);
++    if (state.keys.size() != count || state.values.size() != count) {
++      throw std::runtime_error("import_flat_fp32: state byte count differs from geometry");
++    }
++    for (const auto* values : {&state.keys, &state.values}) {
++      for (float value : *values) {
++        if (!std::isfinite(value)) {
++          throw std::runtime_error("import_flat_fp32: nonfinite state bytes");
++        }
++      }
++    }
++    const auto publish_plan = plan(0, 0, state.valid_length);
++    if (!publish_plan) {
++      throw std::runtime_error("import_flat_fp32: state length rejected by planner");
++    }
++    std::vector<Pool> keys, values;
++    keys.reserve(kpool_.size());
++    values.reserve(vpool_.size());
++    std::vector<Tensor> arrays;
++    arrays.reserve(2 * kpool_.size());
++    const size_t per_layer = count / static_cast<size_t>(state.layers);
++    const ::mlx::core::Shape shape{1, state.heads, state.capacity, state.head_dim};
++    for (size_t layer = 0; layer < kpool_.size(); ++layer) {
++      keys.emplace_back(state.capacity, state.capacity, state.heads, state.head_dim, ::mlx::core::float32);
++      values.emplace_back(state.capacity, state.capacity, state.heads, state.head_dim, ::mlx::core::float32);
++      // The iterator constructor copies host values into owned MLX storage.
++      keys.back().write(0, state.capacity,
++          Tensor(state.keys.data() + layer * per_layer, shape, ::mlx::core::float32), s);
++      values.back().write(0, state.capacity,
++          Tensor(state.values.data() + layer * per_layer, shape, ::mlx::core::float32), s);
++      keys.back().append_storage(arrays);
++      values.back().append_storage(arrays);
++    }
++    ::mlx::core::eval(arrays); // Wait for all candidate arrays before publication.
++    kpool_.swap(keys);
++    vpool_.swap(values);
++    set_attention_selection(nullptr);
++    std::fill(last_update_tokens_.begin(), last_update_tokens_.end(), 0);
++    cache::SequenceCache::clear();
++    cache::SequenceCache::commit(*publish_plan);
++    std::fill(layer_lengths_.begin(), layer_lengths_.end(), state.valid_length);
++  }
++
++  void reset_flat_fp32() {
++    flat_shape(0); // Refuse unsupported kinds without changing them.
++    reset_storage();
++  }
++
++  // Release the owned pools for any validated storage policy. This does not
++  // convert/export KV and must be serialized against delegate execution.
++  void reset_storage() noexcept {
++    set_attention_selection(nullptr);
++    std::fill(last_update_tokens_.begin(), last_update_tokens_.end(), 0);
++    pending_compaction_.reset();
++    pending_cold_install_.reset();
++    for (auto& cold : cold_layers_) cold.reset();
++    cold_tokens_ = 0;
++    cold_layer_count_ = 0;
++    for (size_t layer = 0; layer < kpool_.size(); ++layer) {
++      const cache::LayerConfig& lc =
++          config_.layers.size() == 1 ? config_.layers.front() : config_.layers[layer];
++      const bool ring = lc.policy.kind == cache::LayerPolicy::Kind::Ring;
++      const int maximum = ring ? lc.policy.window +
++          (config_.max_write ? *config_.max_write : lc.policy.window) - 1 : allocation_capacity();
++      const int initial = ring ? maximum : config_.initial_capacity;
++      kpool_[layer].reset_limits(initial, maximum);
++      vpool_[layer].reset_limits(initial, maximum);
++    }
++    cache::SequenceCache::clear();
++    retained_layout_.reset();
++    std::fill(layer_lengths_.begin(), layer_lengths_.end(), 0);
++  }
++
++  void synchronize_flat() {
++    flat_shape(length());
++    synchronize_storage();
++  }
++
++  // Evaluation barrier for allocated pools, independent of dtype/layout.
++  // Prefix rewind is metadata-only and does not need this barrier after an
++  // already completed forward.
++  void synchronize_storage() {
++    if (pending_cold_install_)
++      throw std::runtime_error("synchronize_storage: failed cold installation requires owner retirement");
++    auto arrays = storage_roots();
++    auto hot = attention_selection_roots();
++    arrays.insert(arrays.end(), hot.begin(), hot.end());
++    if (!arrays.empty()) {
++      ::mlx::core::eval(arrays); // Synchronous evaluation, not async_eval.
++    }
++  }
++
++  // Owned roots include every layer's K/V writes. The resident batch caller
++  // must keep external inputs alive and drain before publishing completion.
++  std::vector<Tensor> storage_roots() const {
++    if (pending_cold_install_)
++      throw std::runtime_error("storage_roots: cold conversion has not been published");
++    std::vector<Tensor> arrays;
++    arrays.reserve((has_cold_history() ? 8 : 2) * kpool_.size());
++    for (size_t layer = 0; layer < kpool_.size(); ++layer) {
++      if (cold_layers_[layer]) {
++        const auto& cold = *cold_layers_[layer];
++        arrays.insert(arrays.end(), {cold.key_codes, cold.key_scales, cold.key_biases,
++                                     cold.value_codes, cold.value_scales, cold.value_biases});
++      }
++      kpool_[layer].append_storage(arrays);
++      vpool_[layer].append_storage(arrays);
++    }
++    return arrays;
++  }
++
++  // Separate from canonical roots so full-history snapshots/export keep their
++  // existing ABI. Resident completion must evaluate these too; synchronize_storage does.
++  std::vector<Tensor> attention_selection_roots() const {
++    std::vector<Tensor> arrays;
++    for (const auto& hot : hot_attention_) {
++      if (!hot) continue;
++      hot->keys.append_storage(arrays);
++      hot->values.append_storage(arrays);
++    }
++    return arrays;
++  }
++
+   AttendSpec update_and_fetch(
+       int layer,
+       const std::vector<int32_t>& positions,
+       const Tensor& k,
+       const Tensor& v,
+       StreamOrDevice s) override {
++    if (has_cold_history() || pending_cold_install_)
++      throw std::runtime_error("update_and_fetch: cold history requires explicit compressed attention");
+     if (layer < 0 || layer >= static_cast<int>(kpool_.size())) {
+       throw std::out_of_range("update_and_fetch: layer out of range");
+     }
++    last_update_tokens_[size_t(layer)] = 0;
++    if (k.ndim() != 4 || v.ndim() != 4 || k.shape() != v.shape() || k.shape(0) != 1 || k.shape(2) <= 0)
++      throw std::runtime_error("update_and_fetch: invalid K/V geometry");
+     const int T = static_cast<int>(k.shape(2)); // BHSD: seq axis is 2
++    const int start = run_start(positions, T);
++    if (T != 1 || start != layer_lengths_[size_t(layer)])
++      hot_attention_[size_t(layer)].reset();
++    if (has_compacted_history()) {
++      const size_t l = static_cast<size_t>(layer);
++      const auto append = retained_layout_.plan_append(layer_lengths_[l], start, T);
++      const auto absolute = cache::SequenceCache::plan(layer, start, T);
++      if (!absolute) throw std::runtime_error("retained append exceeds absolute capacity");
++      kpool_[l].write(append.physical_start, T, k, s);
++      vpool_[l].write(append.physical_start, T, v, s);
++      Tensor K = kpool_[l].read(0, append.physical_end, s);
++      Tensor V = vpool_[l].read(0, append.physical_end, s);
++      layer_lengths_[l] = append.absolute_end;
++      last_update_tokens_[l] = T;
++      last_update_end_[l] = start + T;
++      cache::SequenceCache::commit(*absolute);
++      return AttendSpec{K, V, T == 1 ? AttendSpec::Mask::None : AttendSpec::Mask::Causal, std::nullopt};
++    }
+ 
+     std::optional<cache::SeqStepPlan> p =
+-        this->plan(layer, run_start(positions, T), T);
++        this->plan(layer, start, T);
+     if (!p) {
+       throw std::runtime_error(
+           "update_and_fetch: step exceeds capacity or invalid layer");
+@@ -102,6 +1338,9 @@ class MLXSequenceCache : public cache::SequenceCache, public MLXCache {
+     Tensor K = read_runs(kpool_[l], p->read, p->n_read, s);
+     Tensor V = read_runs(vpool_[l], p->read, p->n_read, s);
+     this->commit(*p);
++    layer_lengths_[l] = std::max(layer_lengths_[l], start + T);
++    last_update_tokens_[l] = T;
++    last_update_end_[l] = start + T;
+ 
+     // A single decode token needs no mask -- its span is exactly what it may
+     // attend, on a ring layer as much as a flat one.
+@@ -126,6 +1365,127 @@ class MLXSequenceCache : public cache::SequenceCache, public MLXCache {
+   }
+ 
+  private:
++  struct HotSlotLayout {
++    // Immutable slots at base_end. Later T1 tails occupy base_count +
++    // (absolute_position - base_end), without copying these vectors per token.
++    std::vector<std::vector<int32_t>> positions_by_head;
++    int base_end = 0;
++  };
++
++  struct HotAttention {
++    Pool keys;
++    Pool values;
++    int end = 0;
++    int count = 0;
++    std::shared_ptr<const cache::AttentionSelection> selection;
++    std::shared_ptr<const HotSlotLayout> layout;
++    HotAttention(int slots, int heads, int dimension, ::mlx::core::Dtype dtype)
++        : keys(slots, slots, heads, dimension, dtype),
++          values(slots, slots, heads, dimension, dtype) {}
++  };
++
++  struct AttentionDeltaPlan {
++    std::shared_ptr<const HotSlotLayout> source, destination;
++    int source_end = 0, end = 0, rows = 0;
++    std::optional<Tensor> heads, positions;
++    std::optional<Pool::HeadCells> destinations;
++  };
++
++  static std::unique_ptr<AttentionDeltaPlan> make_delta_plan(
++      const HotAttention& old, const cache::AttentionSelection& next, int end) {
++    auto plan = std::make_unique<AttentionDeltaPlan>();
++    auto layout = std::make_shared<HotSlotLayout>();
++    layout->base_end = end;
++    const int count = int(next.positions_by_head.front().size()) + end - next.covered_length;
++    std::vector<int32_t> heads, positions, destinations;
++    for (size_t h = 0; h < next.positions_by_head.size(); ++h) {
++      std::vector<int32_t> desired = next.positions_by_head[h];
++      for (int position = next.covered_length; position < end; ++position) desired.push_back(position);
++      std::vector<int32_t> old_slot(size_t(end), -1), slots(size_t(count), -1);
++      std::vector<bool> wanted(size_t(end), false);
++      for (int position : desired) wanted[size_t(position)] = true;
++      const auto& base = old.layout->positions_by_head[h];
++      std::vector<int32_t> displaced;
++      for (int slot = 0; slot < old.count; ++slot) {
++        const int position = slot < int(base.size()) ? base[size_t(slot)] :
++            old.layout->base_end + slot - int(base.size());
++        old_slot[size_t(position)] = slot;
++        if (!wanted[size_t(position)]) continue;
++        if (slot < count) slots[size_t(slot)] = position;
++        else displaced.push_back(position);
++      }
++      std::vector<int32_t> holes;
++      for (int slot = 0; slot < count; ++slot) if (slots[size_t(slot)] < 0) holes.push_back(slot);
++      size_t hole = 0;
++      for (int position : displaced) {
++        const int destination = holes.at(hole++);
++        slots[size_t(destination)] = position;
++        heads.push_back(int32_t(h)); positions.push_back(position); destinations.push_back(destination);
++      }
++      for (int position : desired) {
++        if (old_slot[size_t(position)] >= 0) continue;
++        const int destination = holes.at(hole++);
++        slots[size_t(destination)] = position;
++        heads.push_back(int32_t(h)); positions.push_back(position); destinations.push_back(destination);
++      }
++      if (hole != holes.size()) throw std::logic_error("stable attention layout has unfilled live slots");
++      layout->positions_by_head.push_back(std::move(slots));
++    }
++    plan->source = old.layout; plan->destination = std::move(layout);
++    plan->source_end = old.end; plan->end = end;
++    plan->rows = int(positions.size());
++    if (plan->rows) {
++      plan->heads = Tensor(heads.data(), {plan->rows}, ::mlx::core::int32);
++      plan->positions = Tensor(positions.data(), {plan->rows}, ::mlx::core::int32);
++      plan->destinations.emplace(heads, destinations);
++    }
++    return plan;
++  }
++
++  void clear_hot_attention() noexcept {
++    for (auto& hot : hot_attention_) hot.reset();
++    delta_plan_.reset();
++    initial_hot_layout_.reset();
++  }
++
++  FlatFP32State flat_shape(int valid_length) const {
++    // This ABI includes every logical-capacity slot. Its host memcpy sizes
++    // must never be applied to a smaller physical pool. Explicit allocation
++    // mode is deliberately excluded even when its ceiling equals capacity.
++    if (config_.allocation_capacity)
++      throw std::runtime_error("flat FP32 state: explicit allocation ceiling is unsupported");
++    if (has_cold_history() || pending_cold_install_ || has_compacted_history() ||
++        config_.kv_dtype != static_cast<int>(ScalarType::Float) ||
++        valid_length < 0 || valid_length > config_.capacity) {
++      throw std::runtime_error("flat FP32 state: unsupported dtype or invalid length");
++    }
++    const auto& first = config_.layers.front();
++    for (const auto& layer : config_.layers) {
++      if (layer.policy.kind != cache::LayerPolicy::Kind::Flat || layer.policy.window != 0 ||
++          layer.n_kv_heads <= 0 || layer.head_dim <= 0 ||
++          layer.n_kv_heads != first.n_kv_heads || layer.head_dim != first.head_dim) {
++        throw std::runtime_error("flat FP32 state: requires uniform flat B1 geometry");
++      }
++    }
++    FlatFP32State result{config_.n_layers, first.n_kv_heads, config_.capacity, first.head_dim, valid_length, {}, {}};
++    flat_elements(result);
++    return result;
++  }
++
++  static size_t flat_elements(const FlatFP32State& state) {
++    size_t count = 1;
++    for (int dimension : {state.layers, state.heads, state.capacity, state.head_dim}) {
++      if (dimension <= 0 || count > std::numeric_limits<size_t>::max() / static_cast<size_t>(dimension)) {
++        throw std::overflow_error("flat FP32 state: invalid or overflowing geometry");
++      }
++      count *= static_cast<size_t>(dimension);
++    }
++    if (count > std::numeric_limits<size_t>::max() / sizeof(float)) {
++      throw std::overflow_error("flat FP32 state: byte count overflow");
++    }
++    return count;
++  }
++
+   // A sequence cache holds one run of one sequence, so the step is described by
+   // where it starts; the remaining positions carry no information beyond
+   // confirming that. A step this cache cannot represent is refused rather than
+@@ -202,6 +1562,31 @@ class MLXSequenceCache : public cache::SequenceCache, public MLXCache {
+   std::vector<Pool> kpool_;
+   std::vector<Pool> vpool_;
+   std::vector<int> window_; // per layer; 0 = flat (unbounded history)
++  cache::CacheConfig config_;
++  cache::RetainedSequenceLayout retained_layout_;
++  std::vector<int> layer_lengths_;
++  std::vector<int> last_update_tokens_;
++  std::vector<int> last_update_end_;
++  std::shared_ptr<const cache::AttentionSelection> attention_selection_;
++  std::optional<Tensor> attention_indices_;
++  std::unique_ptr<AttentionDeltaPlan> delta_plan_;
++  std::shared_ptr<const HotSlotLayout> initial_hot_layout_;
++  int attention_indices_end_ = 0;
++  uint64_t attention_selection_layer_calls_ = 0;
++  AttentionSelectionStats attention_selection_stats_;
++  std::vector<std::unique_ptr<HotAttention>> hot_attention_;
++  struct PendingCompaction { std::vector<Pool> keys, values; };
++  std::unique_ptr<PendingCompaction> pending_compaction_;
++  struct PendingPrefixAllocation { std::vector<Pool> keys, values; };
++  std::unique_ptr<PendingPrefixAllocation> pending_prefix_allocation_;
++  int cold_tokens_ = 0;
++  int cold_layer_count_ = 0;
++  std::vector<std::optional<ColdLayer>> cold_layers_;
++  struct PendingColdInstall {
++    std::vector<std::optional<ColdLayer>> cold;
++    std::vector<Pool> keys, values;
++  };
++  std::unique_ptr<PendingColdInstall> pending_cold_install_;
+ };
+ 
+ } // namespace mlx
+diff --git a/backends/mlx/runtime/backend_options.h b/backends/mlx/runtime/backend_options.h
+index af9a993..cc8d373 100644
+--- a/backends/mlx/runtime/backend_options.h
++++ b/backends/mlx/runtime/backend_options.h
+@@ -12,6 +12,9 @@
+ 
+ #pragma once
+ 
++#include <cstddef>
++#include <optional>
++
+ namespace executorch {
+ namespace backends {
+ namespace mlx {
+@@ -19,6 +22,20 @@ namespace mlx {
+ // Backend id under which the MLX backend registers (see MLXBackend.cpp).
+ inline constexpr char kMLXBackendId[] = "MLXBackend";
+ 
++// Per-model runtime-spec key (string): exactly "cpu" or "gpu". Unset keeps
++// the existing GPU default. The selected device owns this handle's execution
++// stream; unavailable devices fail init rather than falling back. CPU requires
++// an MLX library built with MLX_BUILD_CPU=ON. Handles may bind the same cache_key
++// on different devices only when the caller serializes and drains execution.
++inline constexpr char kDeviceKey[] = "device";
++
++// CPU handles only: exactly "default", "single", or "multi". Unset/default
++// leaves Accelerate's threading policy unchanged. Explicit policies require
++// macOS 15 / iOS 18 and an MLX CPU-enabled build. The backend sets and reads
++// back the thread-local policy on this handle's CPU scheduler worker before
++// running model work. "multi" lets Accelerate choose the thread count.
++inline constexpr char kCPUBlasThreadingKey[] = "cpu_blas_threading";
++
+ // Per-model runtime-spec key. Value N means: call mlx::core::clear_cache()
+ // every N execute() calls to release MLX's cached buffer pool; 0/unset
+ // disables.
+@@ -35,6 +52,23 @@ inline constexpr char kMLXBackendId[] = "MLXBackend";
+ // peak footprint continuously.
+ inline constexpr char kClearCacheIntervalKey[] = "clear_cache_interval";
+ 
++struct IdleMemoryMaintenance {
++  size_t active_before, cached_before, peak_before;
++  size_t active_after, cached_after, peak_after;
++  size_t synchronized_streams;
++  std::optional<size_t> previous_cache_limit;
++  double drain_ms, reclaim_ms, wall_ms;
++};
++
++// The coordinator must stop all MLX model/observer work before this call.
++// Registered streams must be accessible from the calling thread. This changes
++// the global idle-buffer pool, not live KV or the total process memory limit.
++IdleMemoryMaintenance reclaim_idle_memory(std::optional<size_t> cache_limit);
++
++// Restore only the process-wide idle limit, including after a model failure.
++// No live model/cache access, GPU wait or idle-buffer clearing occurs.
++size_t restore_idle_cache_limit(size_t limit);
++
+ // Per-model runtime-spec key (bool). When true, the handle does not allocate
+ // its own default mutable buffers at init() — per-session buffers are managed
+ // by mlx_mutable_state.h instead. Only valid for multi-session loads, and only
+diff --git a/extension/data_loader/mmap_data_loader.cpp b/extension/data_loader/mmap_data_loader.cpp
+index dc9e1a6..2e55fda 100644
+--- a/extension/data_loader/mmap_data_loader.cpp
++++ b/extension/data_loader/mmap_data_loader.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <cerrno>
+ #include <cstdint>
++#include <cstdio>
+ #include <cstring>
+ #include <limits>
+ 
+@@ -208,6 +209,11 @@ Result<FreeableBuffer> MmapDataLoader::load(
+ 
+   void* pages =
+       ::mmap(nullptr, map_size, PROT_READ, MAP_SHARED, fd_, map_offset);
++  if (pages == MAP_FAILED) {
++    const int mapping_errno = errno;
++    std::fprintf(stderr, "ExecuTorch mmap failed: size=%zu offset=%zu errno=%d (%s)\n",
++                 map_size, range.start, mapping_errno, std::strerror(mapping_errno));
++  }
+   ET_CHECK_OR_RETURN_ERROR(
+       pages != MAP_FAILED,
+       AccessFailed,
+diff --git a/extension/llm/cache/cache.h b/extension/llm/cache/cache.h
+index fb25e43..3bbaf9c 100644
+--- a/extension/llm/cache/cache.h
++++ b/extension/llm/cache/cache.h
+@@ -164,15 +164,31 @@ struct CacheConfig {
+   // Max tokens per step; a ring layer sizes slots to window + max_write - 1.
+   // Unset = each ring layer uses its own window.
+   std::optional<int> max_write;
++  // Optional physical allocation ceiling for a full-history flat cache. It
++  // does not change the model's logical capacity or absolute token positions.
++  // A byte layer must honor or reject it; unset preserves its legacy sizing.
++  // Explicit mode currently excludes ring/sliding and retained compaction.
++  std::optional<int> allocation_capacity;
+ };
+ 
+ // Whether `cfg` satisfies the contract above.
+ inline bool valid(const CacheConfig& cfg) {
+   // initial_capacity may be 0 but not negative, and may exceed capacity -- the
+   // byte layer clamps it.
+-  return cfg.capacity > 0 && cfg.n_layers > 0 && cfg.initial_capacity >= 0 &&
+-      (cfg.layers.size() == 1 ||
+-       cfg.layers.size() == static_cast<size_t>(cfg.n_layers));
++  if (cfg.capacity <= 0 || cfg.n_layers <= 0 || cfg.initial_capacity < 0 ||
++      (cfg.layers.size() != 1 &&
++       cfg.layers.size() != static_cast<size_t>(cfg.n_layers))) {
++    return false;
++  }
++  if (cfg.allocation_capacity) {
++    if (*cfg.allocation_capacity <= 0 || *cfg.allocation_capacity > cfg.capacity)
++      return false;
++    for (const auto& layer : cfg.layers) {
++      if (layer.policy.kind != LayerPolicy::Kind::Flat || layer.policy.window != 0)
++        return false;
++    }
++  }
++  return true;
+ }
+ 
+ } // namespace cache
+diff --git a/extension/llm/cache/sequence_cache.h b/extension/llm/cache/sequence_cache.h
+index 5af756e..f1b99ef 100644
+--- a/extension/llm/cache/sequence_cache.h
++++ b/extension/llm/cache/sequence_cache.h
+@@ -124,6 +124,9 @@ class SequenceCache : public CacheBase,
+   int capacity() const override {
+     return capacity_;
+   }
++  int length() const {
++    return length_;
++  }
+   void clear() override {
+     length_ = 0;
+   }
