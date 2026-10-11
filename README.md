@@ -24,17 +24,21 @@
 ```sh
 git clone https://github.com/GuoqingLiu-eg/TriFuse.git
 cd TriFuse
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements-build.txt
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --no-cache-dir -r requirements-build.txt
 .venv/bin/python tools/bootstrap.py --submodules
 .venv/bin/python tools/build_apple.py --platform ios --python .venv/bin/python
 ```
 
-`bootstrap.py` 根据 `upstream-lock.json` 恢复上游，再应用两份补丁和本地新增源码。它不会下载模型或操作设备；重复运行不会覆盖不同的本地源码。上游本体不重复入仓。
+`bootstrap.py` 根据 `upstream-lock.json` 以浅克隆恢复上游，再应用两份补丁和本地新增源码。它不会下载模型或操作设备；重复运行不会覆盖不同的本地源码。上游本体不重复入仓。
+
+构建失败后可用同一命令重试：脚本会替换自己标记的未完成打包目录，并复用已编译的依赖。成功产物不会被自动覆盖。
 
 `build_apple.py --plan` 可查看构建步骤；`--platform macos` 选择 macOS。构建产物包括 `libTriFuse.a`、需要链接的依赖库清单、公开头文件和 MLX Metal 资源。将链接清单对应的库加入 App，并将资源 bundle 复制进 App；iOS 签名由使用方的 Xcode 工程配置。
 
-本次精简已在 iOS arm64 上完成会话/压缩源码编译，并与现有固定版本依赖库完成链接。完整干净环境构建及模型运行需要依赖和模型准备，不能将链接成功等同于真机推理验证。
+已从 GitHub 全新克隆，在独立 Python 3.12.14 环境中安装依赖、恢复固定版本源码，并完成 iOS arm64 与 macOS arm64 的完整编译和链接，未复用原工程的预编译库。验证环境为 macOS 26.6、Xcode SDK 26.5，部署目标为 26.2；iOS 公开模块的 Swift 导入检查通过。
+
+Mac 上还完成了合成小型 OLMoE 的模型导出与实际 GPU 运行，覆盖 prefill、decode、默认异步生成及 KV 长度/状态推进检查。这是可运行性检查，不代表真实模型的质量或性能结果；本次未执行手机真机推理，可选冷 KV 压缩仅验证了编译和链接。
 
 ## 接入会话
 

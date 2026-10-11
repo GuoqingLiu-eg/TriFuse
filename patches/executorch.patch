@@ -3700,3 +3700,27 @@ index 5af756e..f1b99ef 100644
    void clear() override {
      length_ = 0;
    }
+diff --git a/third-party/CMakeLists.txt b/third-party/CMakeLists.txt
+index 9073d47..c3f56c5 100644
+--- a/third-party/CMakeLists.txt
++++ b/third-party/CMakeLists.txt
+@@ -55,8 +55,18 @@ set(_executorch_host_macos_floor 14.0)
+ set(_executorch_apple_cross
+     "$<AND:$<BOOL:${APPLE}>,$<BOOL:$<FILTER:${PLATFORM},EXCLUDE,^MAC>>>"
+ )
++if(CMAKE_HOST_APPLE)
++  # Xcode's compiler needs an explicit host SDK when CMake's sysroot is empty.
++  # These generators run on macOS even while the application targets iOS.
++  execute_process(
++    COMMAND xcrun --sdk macosx --show-sdk-path
++    OUTPUT_VARIABLE _executorch_host_macos_sdk
++    OUTPUT_STRIP_TRAILING_WHITESPACE
++    COMMAND_ERROR_IS_FATAL ANY
++  )
++endif()
+ set(_executorch_host_osx_args
+-    "$<${_executorch_apple_cross}:-DCMAKE_OSX_SYSROOT=>"
++    "$<$<BOOL:${CMAKE_HOST_APPLE}>:-DCMAKE_OSX_SYSROOT=${_executorch_host_macos_sdk}>"
+     "-DCMAKE_OSX_DEPLOYMENT_TARGET:STRING=$<IF:${_executorch_apple_cross},${_executorch_host_macos_floor},${CMAKE_OSX_DEPLOYMENT_TARGET}>"
+ )
+ 

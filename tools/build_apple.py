@@ -76,7 +76,9 @@ def make_plan(args):
     sdk = 'iphoneos' if args.platform == 'ios' else 'macosx'
     cmake_platform = 'OS64' if args.platform == 'ios' else 'MAC_ARM64'
     target = 'arm64-apple-' + ('ios' if args.platform == 'ios' else 'macos') + args.deployment_target
-    python = str(Path(args.python).resolve()) if '/' in args.python else (shutil.which(args.python) or args.python)
+    # Keep a venv interpreter's symlink path: resolving it would select the base
+    # interpreter and lose the venv's site-packages and build-tool executables.
+    python = os.path.abspath(os.path.expanduser(args.python)) if '/' in args.python else (shutil.which(args.python) or args.python)
     sources = [ROOT / 'src/apple/TFETResidentSession.mm']
     if args.cold_kv:
         sources.append(ROOT / 'src/apple/ColdKVEncoder.mm')
@@ -115,6 +117,10 @@ def make_plan(args):
         'EXECUTORCH_BUILD_COREML': 'OFF', 'EXECUTORCH_BUILD_XNNPACK': 'OFF',
         'EXECUTORCH_BUILD_CPUINFO': 'OFF', 'EXECUTORCH_BUILD_PTHREADPOOL': 'OFF',
     }
+    if args.platform == 'macos':
+        # ios-cmake otherwise marks auxiliary command-line targets as bundles,
+        # which breaks SentencePiece's ordinary executable install rules.
+        flags['CMAKE_MACOSX_BUNDLE'] = 'OFF'
     configure = ['cmake', '-S', str(source), '-B', str(cmake_build), '-G', 'Ninja']
     configure += ['-D' + key + '=' + value for key, value in flags.items()]
     steps = [
@@ -188,11 +194,17 @@ def execute(plan):
     build, output = Path(plan['build_directory']), Path(plan['package_directory'])
     # Reuse CMake/object outputs for incremental builds, but never leave a stale
     # successful package/manifest mixed with a different build configuration.
+    incomplete = output / '.trifuse-incomplete'
     if output.exists():
-        raise RuntimeError('Package output already exists; choose a fresh --build-dir: ' + str(output))
+        if not incomplete.is_file() or (output / 'build-manifest.json').exists():
+            raise RuntimeError('Package output already exists; choose a fresh --build-dir: ' + str(output))
+        # Only discard staging output explicitly marked by our own failed run.
+        # Keep dependency/object builds so a retry does not duplicate them.
+        shutil.rmtree(output)
     objects = build / 'objects'
     objects.mkdir(parents=True, exist_ok=True)
     (output / 'lib').mkdir(parents=True)
+    incomplete.write_text('Incomplete TriFuse build output; safe to replace on retry.\n')
     sdkroot = None
     environment = dict(os.environ, CMAKE_BUILD_PARALLEL_LEVEL=str(plan['jobs']),
         PATH=str(Path(plan['python']).parent) + os.pathsep + os.environ.get('PATH', ''))
@@ -221,8 +233,12 @@ def execute(plan):
             print('+ ' + shlex.join(command), flush=True)
             subprocess.run(command, check=True, env=environment)
     plan.update(status='built_and_linked', sdk_path=sdkroot, build_executed=True,
-        package_sha256={str(path.relative_to(output)): sha(path) for path in sorted(output.rglob('*')) if path.is_file()})
-    (output / 'build-manifest.json').write_text(json.dumps(plan, indent=2) + '\n')
+        package_sha256={str(path.relative_to(output)): sha(path) for path in sorted(output.rglob('*'))
+                        if path.is_file() and path != incomplete})
+    manifest_staging = output / '.build-manifest.json.tmp'
+    manifest_staging.write_text(json.dumps(plan, indent=2) + '\n')
+    manifest_staging.replace(output / 'build-manifest.json')
+    incomplete.unlink()
     print(json.dumps({'status': plan['status'], 'package': str(output), 'model_executed': False}))
 
 
