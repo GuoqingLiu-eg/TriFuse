@@ -32,9 +32,16 @@
 *.provisionprofile
 *.p12
 *.pfx
+*.cer
+*.crt
+*.der
+*.certSigningRequest
 *.pem
 *.key
 *.xcent
+.ssh/
+id_rsa
+id_ed25519
 .env
 .env.*
 .DS_Store
